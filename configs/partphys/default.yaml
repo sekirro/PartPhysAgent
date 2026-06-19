@@ -1,0 +1,42 @@
+output:
+  save_debug: true
+
+object:
+  fallback_to_full_image: true
+
+tools:
+  vlm_provider: none
+  detector: groundingdino
+  sam2_root: /root/autodl-tmp/repos/sam2
+  sam_config: configs/sam2.1/sam2.1_hiera_l.yaml
+
+segmentation:
+  max_parts: 6
+  min_part_area_ratio: 0.01
+  candidate_iou_dedup: 0.90
+  inside_object_ratio: 0.80
+  coverage_threshold: 0.75
+
+physgm:
+  config: ../PhysGM/configs/infer.yaml
+  checkpoint: ../PhysGM/checkpoints/checkpoint.pt
+  template_config: ../PhysGM/configs/physical/down_template.json
+  use_object_isolated_for_whole: true
+  crop_variants:
+    - tight
+    - padded
+    - context_dim
+    - isolated_full
+
+assignment:
+  mode: projection
+  fallback_to_aabb_heuristic: true
+  min_gaussian_count_per_part: 20
+  padding_ratio: 0.15
+  min_half_size: 0.02
+
+simulation:
+  run: false
+  render_img: true
+  compile_video: true
+  white_bg: true
