@@ -82,7 +82,7 @@ def assign_by_projection(positions, part_masks, camera_meta_npz, image_size) -> 
         width, height = image_size
         u_i = np.round(u).astype(np.int64)
         v_i = np.round(v).astype(np.int64)
-        for part in sorted(part_masks, key=lambda item: item["area"]):
+        for part in sorted(part_masks, key=lambda item: item["area"], reverse=True):
             mask = read_mask(part["mask_path"]) if isinstance(part["mask_path"], str) else np.asarray(part["mask_path"], dtype=bool)
             mh, mw = mask.shape
             uu = np.clip((u_i * mw / max(1, width)).astype(np.int64), 0, mw - 1)
@@ -107,7 +107,7 @@ def assign_by_aabb_heuristic(positions, part_instances: list[PartInstance], imag
     span = np.maximum(maxs - mins, 1e-9)
     norm = (positions - mins) / span
     warnings = ["Used approximate AABB heuristic for 2D mask to 3D assignment."]
-    ordered = sorted(part_instances, key=lambda p: p.area)
+    ordered = sorted(part_instances, key=lambda p: p.area, reverse=True)
     for part in ordered:
         bx1 = part.bbox.x1 / max(1, width)
         bx2 = part.bbox.x2 / max(1, width)

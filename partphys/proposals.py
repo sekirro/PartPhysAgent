@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 
 from .image_utils import (
+    bbox_area,
     connected_components_from_mask,
     load_rgb,
     mask_area,
@@ -18,6 +19,7 @@ from .image_utils import (
     save_mask,
     save_rgb,
 )
+from .part_traits import is_main_like_part
 from .types import BBox, MaskCandidate, PartSpec
 
 
@@ -46,11 +48,23 @@ def _candidate_from_mask(
     save_mask(mask, mask_path)
     save_rgb(overlay_mask(image, mask), overlay_path)
     area = mask_area(mask)
+    bbox = mask_to_bbox(mask)
+    bbox_pixels = bbox_area(bbox)
+    object_area = max(1, mask_area(object_mask))
+    item_metadata = dict(metadata or {})
+    item_metadata.setdefault("source", source)
+    item_metadata.setdefault("object_area_ratio", float(area / object_area))
+    item_metadata.setdefault("bbox_area_ratio", float(bbox_pixels / object_area))
+    item_metadata.setdefault("boundary_quality", float(area / max(1, bbox_pixels)))
+    if stability_score is not None:
+        item_metadata.setdefault("stability_score", stability_score)
+    if predicted_iou is not None:
+        item_metadata.setdefault("predicted_iou", predicted_iou)
     cand = MaskCandidate(
         candidate_id=cid,
         source=source,
         mask_path=str(mask_path),
-        bbox=mask_to_bbox(mask),
+        bbox=bbox,
         area=area,
         area_ratio=float(area / max(1, h * w)),
         inside_object_ratio=mask_inside_ratio(mask, object_mask),
@@ -58,23 +72,35 @@ def _candidate_from_mask(
         predicted_iou=predicted_iou,
         prompt=prompt,
         part_scores={},
-        metadata=metadata or {},
+        metadata=item_metadata,
     )
     _write_json(output_dir / f"{cid}.json", cand.to_dict())
     return cand
 
 
 def _dedup_candidates(candidates: list[MaskCandidate]) -> list[MaskCandidate]:
-    source_priority = {"vlm_box_sam": 6, "vlm_box": 5, "schema_location": 4, "text_box_sam": 3, "sam_auto": 2, "appearance_cluster": 1}
+    source_priority = {
+        "text_box_sam": 6,
+        "sam_auto": 5,
+        "object_body": 4,
+        "appearance_cluster": 3,
+        "vlm_box_sam": 2,
+        "schema_location": 1,
+        "vlm_box": 0,
+    }
 
     def better(a: MaskCandidate, b: MaskCandidate) -> MaskCandidate:
+        a_pri = source_priority.get(a.source, 0)
+        b_pri = source_priority.get(b.source, 0)
+        if a_pri != b_pri:
+            return a if a_pri > b_pri else b
         a_stab = a.stability_score if a.stability_score is not None else -1.0
         b_stab = b.stability_score if b.stability_score is not None else -1.0
         if a_stab != b_stab:
             return a if a_stab > b_stab else b
         if a.inside_object_ratio != b.inside_object_ratio:
             return a if a.inside_object_ratio > b.inside_object_ratio else b
-        return a if source_priority.get(a.source, 0) >= source_priority.get(b.source, 0) else b
+        return a if a.area >= b.area else b
 
     kept: list[MaskCandidate] = []
     for cand in candidates:
@@ -88,6 +114,31 @@ def _dedup_candidates(candidates: list[MaskCandidate]) -> list[MaskCandidate]:
         if not replaced:
             kept.append(cand)
     return kept
+
+
+def choose_sam_mask_for_box(masks, bbox_rect_area: int, object_mask: np.ndarray, prefer_score_order: bool = True) -> np.ndarray | None:
+    if not masks:
+        return None
+    object_area = max(1, int(mask_area(object_mask)))
+    rect_area = max(1, int(bbox_rect_area))
+    best = None
+    best_score = -1e9
+    for idx, raw in enumerate(masks):
+        mask = np.asarray(raw, dtype=bool) & object_mask
+        area = max(1, int(mask.sum()))
+        area_ratio_to_box = area / rect_area
+        score = -abs(float(np.log(max(area_ratio_to_box, 1e-6))))
+        if area > object_area * 0.95 and rect_area < object_area * 0.70:
+            score -= 2.0
+        if area > rect_area * 4.0:
+            score -= 1.0
+        score += 0.5 * mask_inside_ratio(mask, object_mask)
+        if prefer_score_order:
+            score -= 0.03 * idx
+        if score > best_score:
+            best_score = score
+            best = mask
+    return best
 
 
 def generate_object_mask(
@@ -111,7 +162,10 @@ def generate_object_mask(
             box = max(boxes, key=lambda x: float(x.get("score", 0.0))).get("bbox")
             masks = sam_tool.segment_from_box(image_path, box)
             if masks:
-                selected_mask = max(masks, key=mask_area)
+                if isinstance(box, dict):
+                    box = BBox.from_dict(box)
+                rect_area = bbox_area(box) if isinstance(box, BBox) else max(1, int((box[2] - box[0]) * (box[3] - box[1])))
+                selected_mask = choose_sam_mask_for_box(masks, rect_area, np.ones((h, w), dtype=bool))
 
     if selected_mask is None and sam_tool is not None:
         try:
@@ -199,6 +253,8 @@ def generate_part_candidates(
     specs = []
     for p in raw_parts:
         specs.append(p if isinstance(p, PartSpec) else PartSpec.from_dict(p))
+    main_like_specs = [spec for spec in specs if is_main_like_part(spec)]
+    allow_object_body = bool(main_like_specs) or len([s for s in specs if s.visible]) <= 1
 
     raw: list[MaskCandidate] = []
     idx = 0
@@ -210,8 +266,13 @@ def generate_part_candidates(
                         masks = sam_tool.segment_from_box(image_path, det["bbox"])
                     except Exception:
                         masks = []
-                    for mask in masks[:1]:
-                        mask = np.asarray(mask, dtype=bool) & object_mask
+                    bbox = det.get("bbox")
+                    if isinstance(bbox, dict):
+                        rect_area = bbox_area(BBox.from_dict(bbox))
+                    else:
+                        rect_area = max(1, int((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))) if bbox else 1
+                    mask = choose_sam_mask_for_box(masks, rect_area, object_mask)
+                    if mask is not None:
                         if mask.sum() < min_area or mask_inside_ratio(mask, object_mask) < 0.80:
                             continue
                         raw.append(
@@ -234,17 +295,19 @@ def generate_part_candidates(
                 mask = np.asarray(item["segmentation"], dtype=bool) & object_mask
                 if mask.sum() < min_area or mask_inside_ratio(mask, object_mask) < 0.80:
                     continue
-                if mask.sum() > 0.95 * max(1, mask_area(object_mask)):
+                near_whole = mask.sum() > 0.95 * max(1, mask_area(object_mask))
+                if near_whole and not allow_object_body:
                     continue
+                source = "object_body" if near_whole else "sam_auto"
                 raw.append(
                     _candidate_from_mask(
                         mask,
-                        "sam_auto",
+                        source,
                         output_dir,
                         idx,
                         image,
                         object_mask,
-                        metadata={"crop_box": item.get("crop_box")},
+                        metadata={"crop_box": item.get("crop_box"), "bbox": item.get("bbox"), "area": item.get("area")},
                         stability_score=item.get("stability_score"),
                         predicted_iou=item.get("predicted_iou"),
                     )
@@ -259,6 +322,23 @@ def generate_part_candidates(
         raw.append(_candidate_from_mask(mask, "appearance_cluster", output_dir, idx, image, object_mask))
         idx += 1
 
+    if allow_object_body:
+        body_prompt = main_like_specs[0].name if main_like_specs else "object body"
+        raw.append(
+            _candidate_from_mask(
+                object_mask.copy(),
+                "object_body",
+                output_dir,
+                idx,
+                image,
+                object_mask,
+                prompt=body_prompt,
+                metadata={"reason": "main/body-like schema part or single visible part"},
+            )
+        )
+        idx += 1
+
+    _write_json(output_dir / "raw_candidates_summary.json", [c.to_dict() for c in raw])
     candidates = _dedup_candidates(raw)
     _write_json(output_dir / "candidates_summary.json", [c.to_dict() for c in candidates])
     return candidates

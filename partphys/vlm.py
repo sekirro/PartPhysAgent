@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .material_table import normalize_material_name
-from .prompts import MATERIAL_VERIFY_PROMPT, MASK_SCORE_PROMPT, PART_SCHEMA_PROMPT, PART_VERIFY_PROMPT
+from .prompts import CANDIDATE_RANK_PROMPT, MATERIAL_VERIFY_PROMPT, MASK_SCORE_PROMPT, PART_SCHEMA_PROMPT, PART_VERIFY_PROMPT
 from .types import PartSpec
 
 
@@ -164,6 +164,42 @@ def _template_schema(object_name: str) -> dict[str, Any]:
                 "physics_group": "body",
             },
         ]
+    elif name in {"cake", "cake_slice", "cake slice", "pastry", "dessert"}:
+        parts = [
+            {
+                "name": "cake_body",
+                "text_prompts": ["cake body", "main cake", "cake base"],
+                "expected_materials": ["Foam", "Plasticine"],
+                "location": "main cake body",
+                "shape_prior": "main body/base",
+                "physical_role": "soft main dessert body",
+                "should_simulate_separately": True,
+                "visible": True,
+                "physics_group": "cake_body",
+            },
+            {
+                "name": "icing",
+                "text_prompts": ["icing", "cream", "frosting"],
+                "expected_materials": ["Foam", "Plasticine", "Snow"],
+                "location": "top or outer cream/icing",
+                "shape_prior": "soft layer",
+                "physical_role": "soft decorative layer",
+                "should_simulate_separately": True,
+                "visible": True,
+                "physics_group": "icing",
+            },
+            {
+                "name": "topping",
+                "text_prompts": ["cake topping", "small visible toppings", "strawberry topping"],
+                "expected_materials": ["Plasticine", "Foam"],
+                "location": "small visible toppings",
+                "shape_prior": "small pieces",
+                "physical_role": "small decorative pieces",
+                "should_simulate_separately": False,
+                "visible": True,
+                "physics_group": "icing",
+            },
+        ]
     else:
         parts = [
             {
@@ -223,6 +259,9 @@ class BaseVLMClient:
     def score_candidate_for_part(self, image_path, candidate_overlay_path, part_spec) -> dict[str, Any]:
         raise NotImplementedError
 
+    def rank_candidates_for_parts(self, image_path: str, contact_sheet_path: str, parts: list[dict], candidates: list[dict]) -> dict[str, Any]:
+        raise NotImplementedError
+
     def verify_selected_parts(self, image_path, overlay_path, parts) -> dict[str, Any]:
         raise NotImplementedError
 
@@ -242,6 +281,9 @@ class NoVLMClient(BaseVLMClient):
 
     def score_candidate_for_part(self, image_path, candidate_overlay_path, part_spec) -> dict[str, Any]:
         return {"score": 0.5, "reason": "No VLM available."}
+
+    def rank_candidates_for_parts(self, image_path: str, contact_sheet_path: str, parts: list[dict], candidates: list[dict]) -> dict[str, Any]:
+        return {"rankings": [], "warnings": ["No VLM candidate ranking available."]}
 
     def verify_selected_parts(self, image_path, overlay_path, parts) -> dict[str, Any]:
         return {"ok": True, "warnings": ["No VLM verification available."]}
@@ -346,6 +388,28 @@ class OpenAICompatibleVLMClient(BaseVLMClient):
             return self._call_json(prompt, candidate_overlay_path)
         except (RuntimeError, TimeoutError, socket.timeout, urllib.error.URLError, KeyError, json.JSONDecodeError) as exc:
             return self._fallback_on_error("score_candidate_for_part", exc, image_path, candidate_overlay_path, part_spec)
+
+    def rank_candidates_for_parts(self, image_path: str, contact_sheet_path: str, parts: list[dict], candidates: list[dict]) -> dict[str, Any]:
+        candidate_brief = [
+            {
+                "candidate_id": c.get("candidate_id"),
+                "source": c.get("source"),
+                "area_ratio": c.get("metadata", {}).get("object_area_ratio", c.get("area_ratio")),
+                "prompt": c.get("prompt"),
+            }
+            for c in candidates
+        ]
+        prompt = (
+            CANDIDATE_RANK_PROMPT
+            + "\nRequested parts:\n"
+            + json.dumps(parts, ensure_ascii=False)
+            + "\nCandidate metadata:\n"
+            + json.dumps(candidate_brief, ensure_ascii=False)
+        )
+        try:
+            return self._call_json(prompt, contact_sheet_path)
+        except (RuntimeError, TimeoutError, socket.timeout, urllib.error.URLError, KeyError, json.JSONDecodeError) as exc:
+            return self._fallback_on_error("rank_candidates_for_parts", exc, image_path, contact_sheet_path, parts, candidates)
 
     def verify_selected_parts(self, image_path, overlay_path, parts) -> dict[str, Any]:
         prompt = PART_VERIFY_PROMPT + f"\nParts: {[p.to_dict() if hasattr(p, 'to_dict') else p for p in parts]}"

@@ -19,6 +19,7 @@ from .image_utils import (
     save_mask,
     save_rgb,
 )
+from .part_traits import is_main_like_part, is_specific_part
 from .types import MaskCandidate, PartInstance, PartSpec
 
 
@@ -33,10 +34,19 @@ def _write_json(path, data):
         json.dump(data, f, indent=2)
 
 
-def _candidate_score(candidate: MaskCandidate, mask: np.ndarray, part: PartSpec, object_mask: np.ndarray, min_part_area_ratio: float) -> float:
+def _candidate_score(
+    candidate: MaskCandidate,
+    mask: np.ndarray,
+    part: PartSpec,
+    object_mask: np.ndarray,
+    min_part_area_ratio: float,
+    return_breakdown: bool = False,
+):
     prompt_text = (candidate.prompt or "").lower()
     prompt_hits = part.name.lower() in prompt_text or any(p.lower() in prompt_text for p in part.text_prompts)
     semantic = 1.0 if prompt_hits else (0.5 if candidate.source == "sam_auto" else 0.3)
+    if candidate.source in {"vlm_box", "schema_location"}:
+        semantic = min(semantic, 0.5)
     material = 0.5
     bbox = candidate.bbox
     h, w = object_mask.shape
@@ -68,20 +78,54 @@ def _candidate_score(candidate: MaskCandidate, mask: np.ndarray, part: PartSpec,
     elif any(k in shape_text for k in ["body", "shell", "main"]):
         shape = 0.8 if candidate.area > 0.08 * max(1, object_mask.sum()) else 0.5
 
-    source = {"vlm_box_sam": 0.95, "vlm_box": 0.85, "text_box_sam": 1.0, "schema_location": 0.55, "sam_auto": 0.7, "appearance_cluster": 0.5}.get(candidate.source, 0.4)
+    source = {
+        "text_box_sam": 1.0,
+        "sam_auto": 0.9,
+        "object_body": 0.8,
+        "appearance_cluster": 0.65,
+        "vlm_box_sam": 0.45,
+        "schema_location": 0.25,
+        "vlm_box": 0.15,
+    }.get(candidate.source, 0.4)
     qualities = [x for x in [candidate.stability_score, candidate.predicted_iou] if x is not None]
     quality = float(np.mean(qualities)) if qualities else 0.5
     score = 0.30 * semantic + 0.20 * material + 0.15 * location + 0.15 * shape + 0.10 * source + 0.10 * quality
 
     area_ratio = candidate.area / max(1, object_mask.sum())
+    penalties: list[str] = []
     if area_ratio < min_part_area_ratio:
         score -= 0.4
-    if area_ratio > 0.95 and "body" not in part.name.lower():
+        penalties.append("below_min_area")
+    main_like = is_main_like_part(part)
+    specific = is_specific_part(part)
+    if specific and area_ratio > 0.70:
+        score -= 0.30
+        penalties.append("specific_part_large_mask")
+    if area_ratio > 0.95 and not main_like:
+        score = min(score, 0.30)
+        penalties.append("near_whole_non_main")
+    elif area_ratio > 0.80 and not main_like:
         score -= 0.25
+        penalties.append("large_non_main")
     comps = connected_components_from_mask(mask, max(1, int(0.05 * max(1, candidate.area))))
     if len(comps) > 4:
         score -= 0.15
-    return float(max(0.0, min(1.0, score)))
+        penalties.append("many_components")
+    score = float(max(0.0, min(1.0, score)))
+    if return_breakdown:
+        return score, {
+            "semantic": float(semantic),
+            "location": float(location),
+            "shape": float(shape),
+            "source": float(source),
+            "quality": float(quality),
+            "material": float(material),
+            "area_ratio": float(area_ratio),
+            "main_like": bool(main_like),
+            "specific": bool(specific),
+            "penalties": penalties,
+        }
+    return score
 
 
 def _save_part(image, mask: np.ndarray, part_id: int, name: str, confidence: float, source_ids: list[str], spec: PartSpec, output_dir: Path) -> PartInstance:

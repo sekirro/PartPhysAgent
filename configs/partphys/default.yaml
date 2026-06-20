@@ -10,12 +10,27 @@ tools:
   groundingdino_model: /root/autodl-tmp/models/grounding-dino-base
   groundingdino_box_threshold: 0.25
   groundingdino_text_threshold: 0.25
+  sam_backend: sam2
   sam2_root: /root/autodl-tmp/repos/sam2
   sam_config: configs/sam2.1/sam2.1_hiera_l.yaml
+  sam_model_type: vit_b
+  sam_points_per_side: 16
+  sam_pred_iou_thresh: 0.88
+  sam_stability_score_thresh: 0.92
+  sam_crop_n_layers: 0
+  sam_min_mask_region_area: 100
 
 segmentation:
+  mode: candidate_pool
+  use_vlm_bbox_proposals: false
+  use_schema_location_proposals: false
+  strict: false
+  residual_policy: unknown
   max_parts: 6
-  min_part_area_ratio: 0.01
+  min_part_area_ratio: 0.002
+  candidate_top_k: 40
+  candidate_contact_sheet_top_k: 24
+  max_vlm_candidates_per_part: 12
   candidate_iou_dedup: 0.90
   inside_object_ratio: 0.80
   coverage_threshold: 0.75

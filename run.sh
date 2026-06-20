@@ -31,11 +31,23 @@ python3 partphys_pipeline.py \
   --groundingdino-model /root/autodl-tmp/models/grounding-dino-base \
   --groundingdino-box-threshold 0.25 \
   --groundingdino-text-threshold 0.25 \
+  --segmentation-mode candidate_pool \
+  --residual-policy unknown \
+  --candidate-top-k 40 \
+  --candidate-contact-sheet-top-k 24 \
+  --max-vlm-candidates-per-part 12 \
+  --sam-backend sam2 \
   --sam-checkpoint /root/autodl-tmp/models/sam2/sam2.1_hiera_large.pt \
   --sam-config configs/sam2.1/sam2.1_hiera_l.yaml \
   --sam2-root /root/autodl-tmp/repos/sam2 \
+  --sam-points-per-side 16 \
+  --sam-pred-iou-thresh 0.88 \
+  --sam-stability-score-thresh 0.92 \
+  --sam-crop-n-layers 0 \
+  --sam-min-mask-region-area 100 \
   --simulate \
   --assignment-mode projection \
+  --min-part-area-ratio 0.002 \
   --segmentation-max-retries 2 \
   --segmentation-vlm-weight 0.55 \
   --segmentation-min-accept-score 0.45

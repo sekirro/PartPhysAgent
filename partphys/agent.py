@@ -45,7 +45,7 @@ from .material_table import (
 from .physgm_runner import PhysGMRunner, _find_physgm_root, _resolve_path
 from .proposals import generate_object_mask, generate_part_candidates
 from .report import write_json, write_warnings
-from .sam_tool import SAMTool
+from .sam_tool import create_sam_tool
 from .selector import select_physical_parts
 from .sim_config_builder import build_part_aware_sim_config
 from .segmentation_agent import SegmentationAgent
@@ -372,11 +372,18 @@ class PartPhysAgent:
         if not checkpoint:
             return None
         try:
-            return SAMTool(
+            return create_sam_tool(
                 checkpoint,
+                backend=_get(self.config, "sam_backend", "sam2"),
                 config=_get(self.config, "sam_config"),
                 device=_get(self.config, "device", "cuda"),
                 sam2_root=_get(self.config, "sam2_root"),
+                model_type=_get(self.config, "sam_model_type", "vit_b"),
+                points_per_side=int(_get(self.config, "sam_points_per_side", 16)),
+                pred_iou_thresh=float(_get(self.config, "sam_pred_iou_thresh", 0.88)),
+                stability_score_thresh=float(_get(self.config, "sam_stability_score_thresh", 0.92)),
+                crop_n_layers=int(_get(self.config, "sam_crop_n_layers", 0)),
+                min_mask_region_area=int(_get(self.config, "sam_min_mask_region_area", 100)),
             )
         except RuntimeError as exc:
             self.warnings.append(str(exc))
@@ -538,7 +545,7 @@ class PartPhysAgent:
 
         manual = self._load_manual_masks(_get(self.config, "masks_json"), image.size)
         manual_parts = bool(manual and manual.get("parts"))
-        require_vlm = not manual_parts
+        require_vlm = bool(_get(self.config, "require_vlm", False))
         vlm = self._init_vlm(required=require_vlm)
         detector = self._init_detector()
         sam = self._init_sam()
@@ -602,9 +609,35 @@ class PartPhysAgent:
                 max_retries=int(_get(self.config, "segmentation_max_retries", 2)),
                 vlm_weight=float(_get(self.config, "segmentation_vlm_weight", 0.55)),
                 min_accept_score=float(_get(self.config, "segmentation_min_accept_score", 0.45)),
+                max_vlm_candidates_per_part=int(_get(self.config, "max_vlm_candidates_per_part", 12)),
+                segmentation_mode=_get(self.config, "segmentation_mode", "candidate_pool"),
+                use_vlm_bbox_proposals=bool(_get(self.config, "use_vlm_bbox_proposals", False)),
+                use_schema_location_proposals=bool(_get(self.config, "use_schema_location_proposals", False)),
+                strict_segmentation=bool(_get(self.config, "strict_segmentation", False)),
+                residual_policy=_get(self.config, "residual_policy", "unknown"),
+                candidate_top_k=int(_get(self.config, "candidate_top_k", 40)),
+                candidate_contact_sheet_top_k=int(_get(self.config, "candidate_contact_sheet_top_k", 24)),
             ).run()
             if not quality.get("ok"):
-                raise RuntimeError(f"Segmentation agent failed: {quality}")
+                self.warnings.append(f"Segmentation accepted with warnings: {quality.get('reason')}")
+
+        if bool(_get(self.config, "mask_only", False)):
+            self.warnings.append("Mask-only mode; stopped after object mask and part masks.")
+            result = PartPhysResult(
+                scene_name=scene_name,
+                object_name=object_name,
+                object_mask_path=str(object_mask_path),
+                parts=parts,
+                part_physics={},
+                whole_physgm=PhysGMResult("", None, "", "", 0.0, 0.0, None, {}),
+                assignment_summary={"mode": "mask_only", "warnings": ["Mask-only mode skipped PhysGM, assignment, and simulation config."]},
+                sim_config_path=None,
+                simulation_output_dir=None,
+                warnings=self.warnings,
+            )
+            _write_json(scene_dir / "partphys_summary.json", result)
+            write_warnings(scene_dir / "warnings.txt", self.warnings)
+            return result
 
         runner = None
 
@@ -668,6 +701,7 @@ class PartPhysAgent:
                 output_dir=whole_dir,
                 save_gaussian=True,
                 use_mvadapter=bool(_get(self.config, "use_mvadapter", False)),
+                multiview_dir=_get(self.config, "multiview_dir"),
             )
         if not whole_result.point_cloud_path:
             self.warnings.append("Whole-object PhysGM did not produce point_clouds.ply.")

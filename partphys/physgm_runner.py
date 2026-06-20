@@ -233,9 +233,8 @@ class PhysGMRunner:
                 raise RuntimeError(f"MV-Adapter multiview generation failed: {exc}") from exc
             return {"view_source": "mvadapter_failed", "error": str(exc), "fallback": "single_image_proxy"}
 
-    def _build_input_scene(self, image_path, scene_name, output_dir, use_mvadapter: bool = False) -> dict:
+    def _build_input_scene(self, image_path, scene_name, output_dir, use_mvadapter: bool = False, multiview_dir: str | None = None) -> dict:
         mvadapter_info = self._maybe_generate_mvadapter(image_path, output_dir, use_mvadapter)
-        multiview_dir = None
         multiview_source = "provided_multiview"
         if mvadapter_info and mvadapter_info.get("view_source") == "mvadapter" and mvadapter_info.get("view_dir"):
             multiview_dir = mvadapter_info["view_dir"]
@@ -281,7 +280,15 @@ class PhysGMRunner:
         _write_json(output_dir / "raw_output_summary.json", raw)
         return PhysGMResult(str(output_dir), str(point_cloud) if point_cloud else None, str(predicted), material, E, nu, density, raw)
 
-    def infer_image(self, image_path, scene_name, output_dir, save_gaussian: bool | None = None, use_mvadapter: bool = False) -> PhysGMResult:
+    def infer_image(
+        self,
+        image_path,
+        scene_name,
+        output_dir,
+        save_gaussian: bool | None = None,
+        use_mvadapter: bool = False,
+        multiview_dir: str | None = None,
+    ) -> PhysGMResult:
         if save_gaussian is None:
             save_gaussian = self.save_gaussian_default
         if self.mock:
@@ -291,7 +298,13 @@ class PhysGMRunner:
         torch = self.torch
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        scene_info = self._build_input_scene(image_path, scene_name, output_dir, use_mvadapter=use_mvadapter)
+        scene_info = self._build_input_scene(
+            image_path,
+            scene_name,
+            output_dir,
+            use_mvadapter=use_mvadapter,
+            multiview_dir=multiview_dir,
+        )
 
         config = copy.deepcopy(self.base_config)
         config.data.data_path = scene_info["data_txt"]

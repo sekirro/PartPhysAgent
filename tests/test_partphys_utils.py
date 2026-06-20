@@ -10,8 +10,8 @@ import numpy as np
 from PIL import Image
 
 from partphys.agent import PartPhysAgent, aggregate_physics_outputs, build_part_crops, weighted_median
-from partphys.gaussian_assign import assign_by_aabb_heuristic, build_part_aabbs, load_ply_positions, save_assignment_outputs
-from partphys.image_utils import bbox_expand, mask_iou, mask_to_bbox, save_mask
+from partphys.gaussian_assign import assign_by_aabb_heuristic, assign_by_projection, build_part_aabbs, load_ply_positions, save_assignment_outputs
+from partphys.image_utils import bbox_expand, mask_iou, mask_to_bbox, read_mask, save_mask
 from partphys.material_table import clamp_physics_to_material, normalize_material_name
 from partphys.multiview import split_mvadapter_grid
 from partphys.physgm_runner import PhysGMRunner
@@ -19,6 +19,7 @@ from partphys.scene_builder import build_physgm_input_scene
 from partphys.segmentation_agent import SegmentationAgent
 from partphys.sim_config_builder import build_part_aware_sim_config
 from partphys.types import BBox, PartInstance
+from partphys.vlm import NoVLMClient
 
 
 def _write_template(path: Path):
@@ -255,6 +256,213 @@ class _FakeRequiredVLM:
             return {"score": 0.95, "reason": "handle bbox candidate"}
         return {"score": 0.10, "reason": "wrong part"}
 
+    def rank_candidates_for_parts(self, image_path, contact_sheet_path, parts, candidates):
+        return {"rankings": [], "warnings": []}
+
+
+class _FailingLocateVLM(NoVLMClient):
+    requires_remote_vlm = True
+
+    def locate_parts(self, image_path, parts):
+        raise AssertionError("locate_parts should not be called in candidate_pool mode")
+
+    def rank_candidates_for_parts(self, image_path, contact_sheet_path, parts, candidates):
+        return {"rankings": [], "warnings": []}
+
+
+class _FakeSAM:
+    def __init__(self, masks):
+        self.masks = masks
+
+    def automatic_masks(self, image_path):
+        return [
+            {
+                "segmentation": mask,
+                "predicted_iou": 0.95,
+                "stability_score": 0.95,
+                "bbox": mask_to_bbox(mask).to_dict(),
+                "area": int(mask.sum()),
+                "crop_box": None,
+            }
+            for mask in self.masks
+        ]
+
+    def segment_from_box(self, image_path, bbox):
+        return []
+
+    def segment_from_points(self, image_path, points, labels):
+        return []
+
+
+def _seg_image_and_object(tmp_path):
+    image = np.full((64, 64, 3), 255, dtype=np.uint8)
+    image[8:56, 8:56] = [130, 130, 130]
+    image_path = tmp_path / "object.png"
+    Image.fromarray(image).save(image_path)
+    object_mask = np.zeros((64, 64), dtype=bool)
+    object_mask[8:56, 8:56] = True
+    object_mask_path = tmp_path / "object_mask.png"
+    save_mask(object_mask, object_mask_path)
+    return image_path, object_mask, object_mask_path
+
+
+def _hammer_schema():
+    return {
+        "object": "hammer",
+        "parts": [
+            {"name": "head", "text_prompts": ["hammer head"], "expected_materials": ["Metal"], "location": "top", "shape_prior": "compact block", "visible": True},
+            {"name": "handle", "text_prompts": ["hammer handle"], "expected_materials": ["Wood"], "location": "lower", "shape_prior": "long thin bar", "visible": True},
+        ],
+    }
+
+
+def _head_handle_masks():
+    head = np.zeros((64, 64), dtype=bool)
+    head[8:28, 10:54] = True
+    handle = np.zeros((64, 64), dtype=bool)
+    handle[30:56, 26:38] = True
+    return head, handle
+
+
+def test_segmentation_agent_no_longer_requires_remote_vlm(tmp_path):
+    image_path, object_mask, object_mask_path = _seg_image_and_object(tmp_path)
+    head, handle = _head_handle_masks()
+    parts, candidates, quality = SegmentationAgent(
+        image_path=image_path,
+        object_mask_path=object_mask_path,
+        object_bbox=mask_to_bbox(object_mask),
+        part_schema=_hammer_schema(),
+        detector=None,
+        sam_tool=_FakeSAM([head, handle]),
+        vlm_client=NoVLMClient(),
+        output_dir=tmp_path / "scene",
+        candidates_dir=tmp_path / "scene" / "candidates",
+        coverage_threshold=0.40,
+        min_accept_score=0.35,
+    ).run()
+    assert {"head", "handle"}.issubset({p.name for p in parts})
+    assert candidates
+    assert quality["reason"] != "requires_remote_vlm"
+
+
+def test_vlm_bbox_disabled_by_default(tmp_path):
+    image_path, object_mask, object_mask_path = _seg_image_and_object(tmp_path)
+    head, handle = _head_handle_masks()
+    parts, _, _ = SegmentationAgent(
+        image_path=image_path,
+        object_mask_path=object_mask_path,
+        object_bbox=mask_to_bbox(object_mask),
+        part_schema=_hammer_schema(),
+        detector=None,
+        sam_tool=_FakeSAM([head, handle]),
+        vlm_client=_FailingLocateVLM(),
+        output_dir=tmp_path / "scene",
+        candidates_dir=tmp_path / "scene" / "candidates",
+        coverage_threshold=0.40,
+        min_accept_score=0.35,
+        use_vlm_bbox_proposals=False,
+    ).run()
+    assert {"head", "handle"}.issubset({p.name for p in parts})
+
+
+def test_wrong_vlm_bbox_does_not_override_sam_candidates(tmp_path):
+    image_path, object_mask, object_mask_path = _seg_image_and_object(tmp_path)
+    head, handle = _head_handle_masks()
+    parts, candidates, _ = SegmentationAgent(
+        image_path=image_path,
+        object_mask_path=object_mask_path,
+        object_bbox=mask_to_bbox(object_mask),
+        part_schema=_hammer_schema(),
+        detector=None,
+        sam_tool=_FakeSAM([head, handle]),
+        vlm_client=_FakeRequiredVLM(),
+        output_dir=tmp_path / "scene",
+        candidates_dir=tmp_path / "scene" / "candidates",
+        coverage_threshold=0.40,
+        min_accept_score=0.35,
+    ).run()
+    by_id = {c.candidate_id: c for c in candidates}
+    selected_sources = {by_id[p.candidate_ids[0]].source for p in parts if p.candidate_ids and p.candidate_ids[0] in by_id}
+    assert selected_sources <= {"sam_auto", "text_box_sam", "appearance_cluster", "object_body"}
+    assert "vlm_box" not in selected_sources
+
+
+def test_no_rectangle_final_mask_when_sam_candidate_exists(tmp_path):
+    image_path, object_mask, object_mask_path = _seg_image_and_object(tmp_path)
+    head, handle = _head_handle_masks()
+    parts, candidates, _ = SegmentationAgent(
+        image_path=image_path,
+        object_mask_path=object_mask_path,
+        object_bbox=mask_to_bbox(object_mask),
+        part_schema=_hammer_schema(),
+        detector=None,
+        sam_tool=_FakeSAM([head, handle]),
+        vlm_client=NoVLMClient(),
+        output_dir=tmp_path / "scene",
+        candidates_dir=tmp_path / "scene" / "candidates",
+        coverage_threshold=0.40,
+        min_accept_score=0.35,
+        use_schema_location_proposals=True,
+    ).run()
+    by_id = {c.candidate_id: c for c in candidates}
+    selected_sources = {by_id[p.candidate_ids[0]].source for p in parts if p.candidate_ids and p.candidate_ids[0] in by_id}
+    assert "schema_location" not in selected_sources
+    assert "vlm_box" not in selected_sources
+
+
+def test_main_body_large_sam_mask_allowed(tmp_path):
+    image_path, object_mask, object_mask_path = _seg_image_and_object(tmp_path)
+    cake_body = object_mask.copy()
+    icing = np.zeros((64, 64), dtype=bool)
+    icing[8:18, 16:48] = True
+    schema = {
+        "object": "cake",
+        "parts": [
+            {"name": "cake_body", "text_prompts": ["cake body"], "expected_materials": ["Foam"], "location": "main cake body", "shape_prior": "main body/base", "visible": True},
+            {"name": "icing", "text_prompts": ["icing"], "expected_materials": ["Foam"], "location": "top", "shape_prior": "soft layer", "visible": True},
+        ],
+    }
+    parts, _, _ = SegmentationAgent(
+        image_path=image_path,
+        object_mask_path=object_mask_path,
+        object_bbox=mask_to_bbox(object_mask),
+        part_schema=schema,
+        detector=None,
+        sam_tool=_FakeSAM([cake_body, icing]),
+        vlm_client=NoVLMClient(),
+        output_dir=tmp_path / "scene",
+        candidates_dir=tmp_path / "scene" / "candidates",
+        coverage_threshold=0.55,
+        min_accept_score=0.35,
+    ).run()
+    assert "cake_body" in {p.name for p in parts}
+    scores = json.loads((tmp_path / "scene" / "agent_logs" / "candidate_scores.json").read_text(encoding="utf-8"))
+    body_scores = [s for s in scores if s["part_name"] == "cake_body"]
+    assert max(s["final_score"] for s in body_scores) >= 0.45
+
+
+def test_residual_policy_unknown_does_not_distort_masks(tmp_path):
+    image_path, object_mask, object_mask_path = _seg_image_and_object(tmp_path)
+    head, handle = _head_handle_masks()
+    parts, _, _ = SegmentationAgent(
+        image_path=image_path,
+        object_mask_path=object_mask_path,
+        object_bbox=mask_to_bbox(object_mask),
+        part_schema=_hammer_schema(),
+        detector=None,
+        sam_tool=_FakeSAM([head, handle]),
+        vlm_client=NoVLMClient(),
+        output_dir=tmp_path / "scene",
+        candidates_dir=tmp_path / "scene" / "candidates",
+        coverage_threshold=0.80,
+        min_accept_score=0.35,
+        residual_policy="unknown",
+    ).run()
+    by_name = {p.name: p for p in parts}
+    assert "unknown_body" in by_name
+    assert np.array_equal(read_mask(by_name["head"].mask_path), head)
+    assert np.array_equal(read_mask(by_name["handle"].mask_path), handle)
+
 
 def test_segmentation_agent_recovers_parts_from_vlm_boxes(tmp_path):
     image = np.full((64, 64, 3), 255, dtype=np.uint8)
@@ -283,12 +491,47 @@ def test_segmentation_agent_recovers_parts_from_vlm_boxes(tmp_path):
         output_dir=tmp_path / "scene",
         candidates_dir=tmp_path / "scene" / "candidates",
         coverage_threshold=0.45,
-        min_accept_score=0.40,
+        min_accept_score=0.30,
+        segmentation_mode="legacy_vlm_bbox",
+        residual_policy="ignore",
     ).run()
     assert quality["ok"]
     assert {p.name for p in parts} == {"head", "handle"}
     assert len(candidates) >= 2
     assert (tmp_path / "scene" / "agent_logs" / "candidate_scores.json").exists()
+
+
+def test_gaussian_assignment_small_overwrites_body(tmp_path):
+    body = np.ones((10, 10), dtype=bool)
+    small = np.zeros((10, 10), dtype=bool)
+    small[4:7, 4:7] = True
+    body_path = tmp_path / "body.png"
+    small_path = tmp_path / "small.png"
+    save_mask(body, body_path)
+    save_mask(small, small_path)
+    meta_path = tmp_path / "input_batch_meta.npz"
+    np.savez(
+        meta_path,
+        input_intr=np.asarray([[1.0, 1.0, 5.0, 5.0]], dtype=np.float32),
+        input_c2ws=np.eye(4, dtype=np.float32)[None, ...],
+    )
+    result = assign_by_projection(
+        np.asarray([[0.0, 0.0, 1.0], [2.0, 2.0, 1.0]], dtype=np.float32),
+        [
+            {"part_id": 0, "mask_path": str(body_path), "area": int(body.sum())},
+            {"part_id": 1, "mask_path": str(small_path), "area": int(small.sum())},
+        ],
+        meta_path,
+        (10, 10),
+    )
+    assert result["gaussian_part_ids"][0] == 1
+
+    parts = [
+        PartInstance(0, "body", str(body_path), BBox(0, 0, 10, 10), int(body.sum()), 1.0),
+        PartInstance(1, "small", str(small_path), BBox(4, 4, 7, 7), int(small.sum()), 1.0),
+    ]
+    heuristic = assign_by_aabb_heuristic(np.asarray([[0.5, 0.5, 0.0], [0.0, 0.0, 0.0], [1.0, 1.0, 0.0]], dtype=np.float32), parts, (10, 10))
+    assert heuristic["gaussian_part_ids"][0] == 1
 
 
 def test_assignment_outputs_part_gaussian_index_and_ply(tmp_path):

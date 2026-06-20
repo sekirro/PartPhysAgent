@@ -37,6 +37,35 @@ Required JSON schema:
 
 MASK_SCORE_PROMPT = """Score whether the highlighted mask corresponds to the requested physical part. Return strict JSON with keys score, reason."""
 
+CANDIDATE_RANK_PROMPT = """Rank existing candidate masks for each requested physical part.
+
+Rules:
+1. You are not allowed to produce bounding boxes.
+2. You are not allowed to output coordinates.
+3. You must select only from the candidate_id values visible in the contact sheet and listed in the candidate metadata.
+4. If none of the candidates match a part, set missing=true.
+5. Do not invent masks or candidate IDs.
+6. Return strict JSON only.
+
+Required JSON schema:
+{
+  "rankings": [
+    {
+      "part_name": "cake_body",
+      "candidates": [
+        {
+          "candidate_id": "candidate_003",
+          "score": 0.92,
+          "reason": "Mask covers the main cake body without plate."
+        }
+      ],
+      "missing": false
+    }
+  ],
+  "warnings": []
+}
+"""
+
 PART_VERIFY_PROMPT = """Verify whether the selected part masks are physically meaningful, visible, and non-overlapping enough for part-aware MPM simulation. Return strict JSON."""
 
 MATERIAL_VERIFY_PROMPT = """Infer the likely PhysGM material class for the highlighted object part. Use only: Wood, Metal, Plastic, Glass, Fabric, Leather, Ceramic, Stone, Rubber, Paper, Sand, Snow, Plasticine, Foam. Return strict JSON."""

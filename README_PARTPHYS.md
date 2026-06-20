@@ -20,12 +20,13 @@ Install and verify the original PhysGM first, following `../PhysGM/README.md`.
 Optional tools:
 
 - SAM2 repository and checkpoints for masks
+- SAM1 `segment-anything` and checkpoints for direct automatic masks
 - GroundingDINO dependencies for text-grounded boxes
 - `opencv-python` for better mask cleanup
 - `plyfile` for binary PLY loading
 - `scikit-learn` for KMeans appearance proposals
 
-SAM2 and GroundingDINO are optional if you provide `--masks-json`. This project uses SAM2 only; SAM1 `segment-anything` is not supported.
+SAM and GroundingDINO are optional if you provide `--masks-json`. Automatic segmentation can run without a VLM by using fallback part templates and SAM candidates.
 
 
 SAM2 paths used by the automatic pipeline:
@@ -37,24 +38,39 @@ SAM2 paths used by the automatic pipeline:
 
 ## Commands
 
-Full automatic:
+Full automatic with SAM2:
 
 ```bash
 python partphys_pipeline.py \
   --image examples/hammer.png \
-  --scene-name hammer_001 \
+  --scene-name hammer_partphys \
   --object hammer \
-  --output-dir /root/autodl-tmp/results_partphys \
-  --sam-checkpoint /root/autodl-tmp/models/sam2/sam2.1_hiera_large.pt \
+  --sam-backend sam2 \
+  --sam-checkpoint /path/to/sam2.1_hiera_large.pt \
   --sam-config configs/sam2.1/sam2.1_hiera_l.yaml \
-  --sam2-root /root/autodl-tmp/repos/sam2 \
-  --groundingdino-config path/to/GroundingDINO_SwinT_OGC.py \
-  --groundingdino-weights path/to/groundingdino_swint_ogc.pth \
-  --physgm-root ../PhysGM \
+  --vlm-provider openai_compatible \
+  --vlm-model <model> \
+  --physgm-root /path/to/PhysGM \
   --physgm-config configs/infer.yaml \
-  --checkpoint checkpoints/checkpoint.pt \
-  --template-config configs/physical/down_template.json \
+  --checkpoint /path/to/checkpoint.pt \
+  --template-config /path/to/down_template.json \
   --simulate
+```
+
+Cake mask debug with SAM1:
+
+```bash
+python partphys_pipeline.py \
+  --image examples/cake.png \
+  --scene-name cake_candidate_pool \
+  --object cake \
+  --sam-backend sam1 \
+  --sam-checkpoint sam_vit_b_01ec64.pth \
+  --sam-model-type vit_b \
+  --min-part-area-ratio 0.002 \
+  --coverage-threshold 0.55 \
+  --residual-policy unknown \
+  --mask-only
 ```
 
 Manual masks:
@@ -143,7 +159,19 @@ python -m pytest tests/test_partphys_utils.py
 
 ## Segmentation Agent Outputs
 
-Automatic part segmentation now requires a VLM:
+Automatic part segmentation now uses a candidate-pool pipeline by default:
+
+```text
+object mask
+  -> SAM/GroundingDINO/appearance candidate masks
+  -> rule-based candidate scoring
+  -> optional VLM candidate-id ranking from a contact sheet
+  -> non-overlapping physical part masks
+```
+
+The VLM does not generate final bounding boxes in the default path. It may generate the part schema, rank existing candidate masks by `candidate_id`, verify masks, and infer material priors. VLM bbox proposals are disabled by default because they are rough and can degrade mask quality.
+
+Mask-only automatic segmentation:
 
 ```bash
 python partphys_pipeline.py \
@@ -156,7 +184,7 @@ python partphys_pipeline.py \
   --vlm-api-base <openai-compatible-base-url> \
   --vlm-api-key-env OPENAI_API_KEY \
   --physgm-root /root/PhysGM \
-  --segmentation-only
+  --mask-only
 ```
 
 The segmentation agent writes:
@@ -167,9 +195,30 @@ The segmentation agent writes:
 <scene>/agent_logs/segmentation_agent_decisions.json
 <scene>/agent_logs/candidate_scores.json
 <scene>/agent_logs/quality_report.json
+<scene>/agent_logs/contact_sheet_all.png
+<scene>/candidates/raw_candidates_summary.json
+<scene>/candidates/candidates_summary.json
 <scene>/assignment/gaussian_part_ids.npy
 <scene>/assignment/part_gaussian_index.json
 <scene>/assignment/per_part_gaussians/part_XXX_<name>.ply
 ```
 
 Use `--whole-physgm-dir <dir>` to reuse an existing whole-object PhysGM output directory containing `point_clouds.ply` and optional `input_batch_meta.npz`. Without it, the pipeline runs whole-object PhysGM and then assigns the resulting Gaussians to the selected parts.
+
+Legacy VLM bbox mode is available but not recommended:
+
+```bash
+--segmentation-mode legacy_vlm_bbox \
+--use-vlm-bbox-proposals \
+--use-schema-location-proposals
+```
+
+Use it only for debugging old behavior. The default is:
+
+```text
+--segmentation-mode candidate_pool
+--residual-policy unknown
+--strict-segmentation false
+--use-vlm-bbox-proposals false
+--use-schema-location-proposals false
+```
