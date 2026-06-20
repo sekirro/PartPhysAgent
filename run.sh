@@ -28,6 +28,9 @@ python3 partphys_pipeline.py \
   --mvadapter-variant sd \
   --mvadapter-num-views 6 \
   --mvadapter-steps 50 \
+  --groundingdino-model /root/autodl-tmp/models/grounding-dino-base \
+  --groundingdino-box-threshold 0.25 \
+  --groundingdino-text-threshold 0.25 \
   --sam-checkpoint /root/autodl-tmp/models/sam2/sam2.1_hiera_large.pt \
   --sam-config configs/sam2.1/sam2.1_hiera_l.yaml \
   --sam2-root /root/autodl-tmp/repos/sam2 \

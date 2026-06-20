@@ -6,7 +6,10 @@ object:
 
 tools:
   vlm_provider: none
-  detector: groundingdino
+  detector: groundingdino_hf
+  groundingdino_model: /root/autodl-tmp/models/grounding-dino-base
+  groundingdino_box_threshold: 0.25
+  groundingdino_text_threshold: 0.25
   sam2_root: /root/autodl-tmp/repos/sam2
   sam_config: configs/sam2.1/sam2.1_hiera_l.yaml
 

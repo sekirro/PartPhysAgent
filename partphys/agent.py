@@ -13,7 +13,7 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-from .detectors import GroundingDINODetector, NoDetector
+from .detectors import GroundingDINODetector, HuggingFaceGroundingDINODetector, NoDetector
 from .gaussian_assign import (
     assign_by_aabb_heuristic,
     assign_by_projection,
@@ -339,10 +339,29 @@ class PartPhysAgent:
         return NoVLMClient()
 
     def _init_detector(self):
+        model_id = _get(self.config, "groundingdino_model")
+        box_threshold = float(_get(self.config, "groundingdino_box_threshold", 0.25))
+        text_threshold = float(_get(self.config, "groundingdino_text_threshold", 0.25))
+        if model_id:
+            detector = HuggingFaceGroundingDINODetector(
+                model_id,
+                device=_get(self.config, "device", "cuda"),
+                box_threshold=box_threshold,
+                text_threshold=text_threshold,
+            )
+            if detector.warning:
+                self.warnings.append(detector.warning)
+            return detector
         config = _get(self.config, "groundingdino_config")
         weights = _get(self.config, "groundingdino_weights")
         if config and weights:
-            detector = GroundingDINODetector(config, weights, device=_get(self.config, "device", "cuda"))
+            detector = GroundingDINODetector(
+                config,
+                weights,
+                device=_get(self.config, "device", "cuda"),
+                box_threshold=box_threshold,
+                text_threshold=text_threshold,
+            )
             if detector.warning:
                 self.warnings.append(detector.warning)
             return detector
