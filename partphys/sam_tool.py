@@ -110,8 +110,11 @@ class SAM2Tool(BaseSAMTool):
         bbox = _coerce_bbox(bbox)
         image = self._load_image_np(image_path)
         self.predictor.set_image(image)
+        center = np.array([[(bbox.x1 + bbox.x2) * 0.5, (bbox.y1 + bbox.y2) * 0.5]], dtype=np.float32)
         masks, scores, _ = self.predictor.predict(
             box=np.array([bbox.x1, bbox.y1, bbox.x2, bbox.y2], dtype=np.float32),
+            point_coords=center,
+            point_labels=np.array([1], dtype=np.int32),
             multimask_output=True,
             normalize_coords=False,
         )

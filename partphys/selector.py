@@ -19,7 +19,7 @@ from .image_utils import (
     save_mask,
     save_rgb,
 )
-from .part_traits import is_main_like_part, is_specific_part
+from .part_traits import is_collection_part, is_frosting_like_part, is_main_like_part, is_plate_like_part, is_specific_part
 from .types import MaskCandidate, PartInstance, PartSpec
 
 
@@ -43,21 +43,31 @@ def _candidate_score(
     return_breakdown: bool = False,
 ):
     prompt_text = (candidate.prompt or "").lower()
-    prompt_hits = part.name.lower() in prompt_text or any(p.lower() in prompt_text for p in part.text_prompts)
+    part_prompts = [part.name.lower(), *[p.lower() for p in part.text_prompts]]
+    prompt_hits = bool(prompt_text) and any(p and p in prompt_text for p in part_prompts)
     semantic = 1.0 if prompt_hits else (0.5 if candidate.source == "sam_auto" else 0.3)
+    if candidate.source == "appearance_cluster" and not prompt_hits:
+        semantic = 0.45
+    if is_specific_part(part) and not prompt_hits and (prompt_text or candidate.source == "sam_auto"):
+        semantic = min(semantic, 0.05)
     if candidate.source in {"vlm_box", "schema_location"}:
         semantic = min(semantic, 0.5)
     material = 0.5
     bbox = candidate.bbox
     h, w = object_mask.shape
+    obj_bbox = mask_to_bbox(object_mask)
+    obj_h = max(1, obj_bbox.height or h)
     cx = ((bbox.x1 + bbox.x2) / 2.0) / max(1, w)
     cy = ((bbox.y1 + bbox.y2) / 2.0) / max(1, h)
+    y1 = bbox.y1 / max(1, h)
+    y2 = bbox.y2 / max(1, h)
     loc = (part.location or "").lower()
     location = 0.6
     if any(k in loc for k in ["top", "upper"]):
-        location = 1.0 if cy < 0.55 else 0.25
+        location = 1.0 if y1 < 0.48 else (0.7 if cy < 0.58 else 0.25)
     if any(k in loc for k in ["bottom", "lower", "sole"]):
-        location = max(location, 1.0 if cy > 0.45 else 0.25)
+        bottom_score = 1.0 if y2 > 0.68 and y1 > 0.42 else (0.7 if cy > 0.55 else 0.25)
+        location = max(location, bottom_score)
     if "left" in loc:
         location = max(location, 1.0 if cx < 0.60 else 0.35)
     if "right" in loc:
@@ -69,7 +79,10 @@ def _candidate_score(
     aspect = bbox.width / max(1, bbox.height)
     fill = mask_area(mask) / max(1, bbox.width * bbox.height)
     shape = 0.55
-    if any(k in shape_text for k in ["long", "thin", "handle", "lace"]):
+    bbox_height_ratio = bbox.height / obj_h
+    if is_plate_like_part(part):
+        shape = 1.0 if aspect > 2.2 and bbox_height_ratio < 0.45 and cy > 0.55 else 0.2
+    elif any(k in shape_text for k in ["long", "thin", "handle", "lace"]):
         shape = 1.0 if aspect > 2.0 or aspect < 0.5 else 0.35
     elif any(k in shape_text for k in ["round", "wheel", "tire"]):
         shape = 1.0 if 0.55 <= aspect <= 1.8 and fill > 0.35 else 0.45
@@ -79,15 +92,16 @@ def _candidate_score(
         shape = 0.8 if candidate.area > 0.08 * max(1, object_mask.sum()) else 0.5
 
     source = {
+        "color_prior": 1.0,
         "text_box_sam": 1.0,
         "sam_auto": 0.9,
         "object_body": 0.8,
-        "appearance_cluster": 0.65,
+        "appearance_cluster": 0.85,
         "vlm_box_sam": 0.45,
         "schema_location": 0.25,
         "vlm_box": 0.15,
     }.get(candidate.source, 0.4)
-    qualities = [x for x in [candidate.stability_score, candidate.predicted_iou] if x is not None]
+    qualities = [x for x in [candidate.stability_score, candidate.predicted_iou, candidate.metadata.get("boundary_quality")] if x is not None]
     quality = float(np.mean(qualities)) if qualities else 0.5
     score = 0.30 * semantic + 0.20 * material + 0.15 * location + 0.15 * shape + 0.10 * source + 0.10 * quality
 
@@ -96,6 +110,33 @@ def _candidate_score(
     if area_ratio < min_part_area_ratio:
         score -= 0.4
         penalties.append("below_min_area")
+    if candidate.source == "sam_auto" and is_specific_part(part) and not prompt_hits:
+        score -= 0.12
+        penalties.append("unprompted_sam_auto_specific")
+    if prompt_text and is_specific_part(part) and not prompt_hits:
+        score -= 0.25
+        penalties.append("prompt_mismatch_specific")
+    if candidate.source == "text_box_sam" and float(candidate.metadata.get("boundary_quality", 1.0)) < 0.35:
+        score -= 0.12
+        penalties.append("low_boundary_quality_text_box")
+    if is_collection_part(part) and candidate.source == "sam_auto" and area_ratio < 0.06:
+        score -= 0.12
+        penalties.append("single_blob_for_collection")
+    if is_frosting_like_part(part) and candidate.source in {"sam_auto", "appearance_cluster"} and area_ratio < 0.06:
+        score -= 0.25
+        penalties.append("tiny_blob_for_layer")
+    elif is_frosting_like_part(part) and candidate.source == "sam_auto" and area_ratio < 0.08:
+        score -= 0.10
+        penalties.append("single_blob_for_layer")
+    if is_frosting_like_part(part) and area_ratio > 0.35:
+        score -= min(0.35, 0.12 + 0.7 * (area_ratio - 0.35))
+        penalties.append("oversized_frosting_candidate")
+    if is_plate_like_part(part) and area_ratio > 0.40:
+        score -= min(0.35, 0.15 + 0.8 * (area_ratio - 0.40))
+        penalties.append("oversized_plate_candidate")
+    if is_plate_like_part(part) and area_ratio < 0.05:
+        score -= 0.25
+        penalties.append("tiny_plate_candidate")
     main_like = is_main_like_part(part)
     specific = is_specific_part(part)
     if specific and area_ratio > 0.70:

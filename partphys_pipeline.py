@@ -97,6 +97,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--segmentation-max-retries", type=int, default=2)
     parser.add_argument("--segmentation-vlm-weight", type=float, default=0.55)
     parser.add_argument("--segmentation-min-accept-score", type=float, default=0.45)
+    parser.add_argument("--agent-mode", choices=["pipeline", "agent"], default="pipeline", help="Use the closed-loop planner/critic part segmentation agent.")
+    parser.add_argument("--agent-rounds", type=int, default=2, help="Maximum segmentation repair rounds when --agent-mode agent is enabled.")
+    parser.add_argument("--agent-max-overlap-ratio", type=float, default=0.10, help="Deterministic agent critic overlap threshold before requesting layout repair.")
     parser.add_argument("--debug", action="store_true")
     return parser
 

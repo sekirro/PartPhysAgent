@@ -11,7 +11,15 @@ from pathlib import Path
 from typing import Any
 
 from .material_table import normalize_material_name
-from .prompts import CANDIDATE_RANK_PROMPT, MATERIAL_VERIFY_PROMPT, MASK_SCORE_PROMPT, PART_SCHEMA_PROMPT, PART_VERIFY_PROMPT
+from .prompts import (
+    CANDIDATE_RANK_PROMPT,
+    MATERIAL_VERIFY_PROMPT,
+    MASK_SCORE_PROMPT,
+    PART_AGENT_CRITIQUE_PROMPT,
+    PART_AGENT_PLAN_PROMPT,
+    PART_SCHEMA_PROMPT,
+    PART_VERIFY_PROMPT,
+)
 from .types import PartSpec
 
 
@@ -271,6 +279,12 @@ class BaseVLMClient:
     def infer_material_prior(self, image_path, part_name) -> dict[str, Any]:
         raise NotImplementedError
 
+    def plan_part_segmentation(self, image_path, object_name, previous_critique=None) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def critique_part_segmentation(self, overlay_path, parts, quality_report) -> dict[str, Any]:
+        raise NotImplementedError
+
 
 class NoVLMClient(BaseVLMClient):
     def identify_object(self, image_path, object_hint=None) -> dict[str, Any]:
@@ -293,6 +307,26 @@ class NoVLMClient(BaseVLMClient):
 
     def infer_material_prior(self, image_path, part_name) -> dict[str, Any]:
         return {"material": "Plastic", "confidence": 0.0, "source": "fallback"}
+
+    def plan_part_segmentation(self, image_path, object_name, previous_critique=None) -> dict[str, Any]:
+        schema = normalize_part_schema(_template_schema(object_name or "object"), object_name)
+        return {
+            "object": schema["object"],
+            "parts": schema["parts"],
+            "tool_plan": [
+                {"action": "generate_object_mask", "reason": "fallback planner"},
+                {"action": "generate_part_candidates", "reason": "fallback planner"},
+                {"action": "rank_candidates", "reason": "fallback planner"},
+                {"action": "multiview_align", "reason": "fallback planner"},
+                {"action": "gaussian_assign", "reason": "fallback planner"},
+                {"action": "knn_cleanup", "reason": "fallback planner"},
+            ],
+            "quality_gates": {"max_unknown_ratio": 0.05, "max_overlap_ratio": 0.03, "require_multiview_alignment": True},
+            "warnings": ["No VLM planner available; used template plan."],
+        }
+
+    def critique_part_segmentation(self, overlay_path, parts, quality_report) -> dict[str, Any]:
+        return {"ok": bool(quality_report.get("ok", True)), "failure_modes": [], "repair_actions": [], "notes": ["No VLM critic available."]}
 
 
 class OpenAICompatibleVLMClient(BaseVLMClient):
@@ -438,3 +472,28 @@ class OpenAICompatibleVLMClient(BaseVLMClient):
             return self._call_json(prompt, image_path)
         except (RuntimeError, TimeoutError, socket.timeout, urllib.error.URLError, KeyError, json.JSONDecodeError) as exc:
             return self._fallback_on_error("infer_material_prior", exc, image_path, part_name)
+
+    def plan_part_segmentation(self, image_path, object_name, previous_critique=None) -> dict[str, Any]:
+        prompt = (
+            PART_AGENT_PLAN_PROMPT
+            + f"\nObject name: {object_name}\n"
+            + "Previous critique:\n"
+            + json.dumps(previous_critique or {}, ensure_ascii=False)
+        )
+        try:
+            return self._call_json(prompt, image_path)
+        except (RuntimeError, TimeoutError, socket.timeout, urllib.error.URLError, KeyError, json.JSONDecodeError) as exc:
+            return self._fallback_on_error("plan_part_segmentation", exc, image_path, object_name, previous_critique)
+
+    def critique_part_segmentation(self, overlay_path, parts, quality_report) -> dict[str, Any]:
+        prompt = (
+            PART_AGENT_CRITIQUE_PROMPT
+            + "\nParts:\n"
+            + json.dumps([p.to_dict() if hasattr(p, "to_dict") else p for p in parts], ensure_ascii=False)
+            + "\nQuality report:\n"
+            + json.dumps(quality_report or {}, ensure_ascii=False)
+        )
+        try:
+            return self._call_json(prompt, overlay_path)
+        except (RuntimeError, TimeoutError, socket.timeout, urllib.error.URLError, KeyError, json.JSONDecodeError) as exc:
+            return self._fallback_on_error("critique_part_segmentation", exc, overlay_path, parts, quality_report)

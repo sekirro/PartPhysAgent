@@ -8,8 +8,25 @@ from typing import Any
 import numpy as np
 
 from .contact_sheet import build_candidate_contact_sheet
-from .image_utils import bbox_area, load_rgb, mask_area, mask_inside_ratio, mask_to_bbox, overlay_multiple_masks, read_mask, save_rgb
-from .part_traits import is_main_like_part, is_specific_part, specificity_rank
+from .image_utils import (
+    bbox_area,
+    connected_components_from_mask,
+    load_rgb,
+    mask_area,
+    mask_inside_ratio,
+    mask_to_bbox,
+    overlay_multiple_masks,
+    read_mask,
+    save_rgb,
+)
+from .part_traits import (
+    is_collection_part,
+    is_frosting_like_part,
+    is_main_like_part,
+    is_plate_like_part,
+    is_specific_part,
+    specificity_rank,
+)
 from .proposals import _candidate_from_mask, _dedup_candidates, choose_sam_mask_for_box, generate_part_candidates
 from .selector import _candidate_score, _save_part
 from .types import BBox, MaskCandidate, PartInstance, PartSpec
@@ -17,7 +34,7 @@ from .vlm import part_specs_from_schema
 
 
 RECT_SOURCES = {"vlm_box", "schema_location"}
-SAM_LIKE_SOURCES = {"text_box_sam", "sam_auto", "object_body", "appearance_cluster", "vlm_box_sam"}
+SAM_LIKE_SOURCES = {"color_prior", "text_box_sam", "sam_auto", "object_body", "appearance_cluster", "vlm_box_sam"}
 
 
 def _safe_name(name: str) -> str:
@@ -179,7 +196,7 @@ class SegmentationAgent:
             candidates = self._append_vlm_box_candidates(candidates, specs, image, object_mask, min_area, reason="explicit")
         if self.use_schema_location_proposals:
             candidates = self._append_schema_location_candidates(candidates, specs, image, object_mask, min_area, reason="explicit")
-        candidates = self._rank_general_candidates(_dedup_candidates(candidates))[: max(1, self.candidate_top_k)]
+        candidates = self._select_balanced_candidates(_dedup_candidates(candidates), max(1, self.candidate_top_k))
         _write_json(self.candidates_dir / "candidates_summary.json", [c.to_dict() for c in candidates])
 
         contact_candidates = candidates[: max(1, self.candidate_contact_sheet_top_k)]
@@ -214,6 +231,7 @@ class SegmentationAgent:
 
     def _rank_general_candidates(self, candidates: list[MaskCandidate]) -> list[MaskCandidate]:
         priority = {
+            "color_prior": 7,
             "text_box_sam": 6,
             "sam_auto": 5,
             "object_body": 4,
@@ -223,6 +241,41 @@ class SegmentationAgent:
             "vlm_box": 0,
         }
         return sorted(candidates, key=lambda c: (priority.get(c.source, 0), _candidate_quality(c), c.area), reverse=True)
+
+    def _select_balanced_candidates(self, candidates: list[MaskCandidate], top_k: int) -> list[MaskCandidate]:
+        ranked = self._rank_general_candidates(candidates)
+        by_source: dict[str, list[MaskCandidate]] = {}
+        for cand in ranked:
+            by_source.setdefault(cand.source, []).append(cand)
+
+        quotas = {
+            "color_prior": max(8, top_k // 5),
+            "text_box_sam": max(10, top_k // 3),
+            "sam_auto": max(6, top_k // 6),
+            "appearance_cluster": max(10, top_k // 4),
+            "object_body": 2,
+            "vlm_box_sam": 4,
+            "schema_location": 4,
+            "vlm_box": 2,
+        }
+        selected: list[MaskCandidate] = []
+        selected_ids: set[str] = set()
+        for source, quota in quotas.items():
+            for cand in by_source.get(source, [])[:quota]:
+                if cand.candidate_id in selected_ids:
+                    continue
+                selected.append(cand)
+                selected_ids.add(cand.candidate_id)
+                if len(selected) >= top_k:
+                    return selected
+        for cand in ranked:
+            if cand.candidate_id in selected_ids:
+                continue
+            selected.append(cand)
+            selected_ids.add(cand.candidate_id)
+            if len(selected) >= top_k:
+                break
+        return selected
 
     def _rank_with_vlm(self, contact_sheet: str, specs: list[PartSpec], candidates: list[MaskCandidate]) -> dict[str, dict[str, dict[str, Any]]]:
         rankings: dict[str, dict[str, dict[str, Any]]] = {}
@@ -439,17 +492,21 @@ class SegmentationAgent:
             if chosen is None:
                 self.logs["warnings"].append(f"No reliable candidate selected for visible part {spec.name}.")
                 continue
+            if is_collection_part(spec):
+                chosen = self._merge_collection_part(chosen, scored_by_spec.get(spec.name, []), used, object_area, min_area)
             used |= chosen["mask"]
             resolved.append(chosen)
             if len(resolved) >= self.max_parts:
                 break
 
+        self._refine_layered_layout(resolved, image, object_mask, min_area)
+        self._apply_spatial_priors(resolved, object_mask, min_area)
         self._apply_residual_policy(resolved, object_mask, min_area)
 
         parts: list[PartInstance] = []
         for idx, item in enumerate(resolved[: self.max_parts]):
             cand = item.get("candidate")
-            ids = [cand.candidate_id] if cand is not None else [item.get("candidate_id", "residual_or_object")]
+            ids = item.get("candidate_ids") or ([cand.candidate_id] if cand is not None else [item.get("candidate_id", "residual_or_object")])
             part = _save_part(
                 image,
                 item["mask"],
@@ -465,6 +522,282 @@ class SegmentationAgent:
             _write_json(Path(part.mask_path).parent / "part_summary.json", {"part": part.to_dict()})
             parts.append(part)
         return parts, score_log
+
+    def _refine_layered_layout(self, resolved: list[dict[str, Any]], image, object_mask: np.ndarray, min_area: int) -> None:
+        if len(resolved) < 3:
+            return
+        plate_items = [item for item in resolved if is_plate_like_part(item["spec"])]
+        frosting_items = [item for item in resolved if is_frosting_like_part(item["spec"])]
+        collection_items = [item for item in resolved if is_collection_part(item["spec"])]
+        base_items = [
+            item
+            for item in resolved
+            if is_main_like_part(item["spec"])
+            and not is_plate_like_part(item["spec"])
+            and not is_frosting_like_part(item["spec"])
+            and not is_collection_part(item["spec"])
+        ]
+        if not (frosting_items and base_items and (plate_items or collection_items)):
+            return
+
+        arr = np.asarray(image.convert("RGB")).astype(np.float32)
+        r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+        maxc = np.maximum.reduce([r, g, b])
+        minc = np.minimum.reduce([r, g, b])
+        sat = maxc - minc
+        h, w = object_mask.shape
+        yy = np.arange(h, dtype=np.float32)[:, None] / max(1, h - 1)
+
+        red = (r > 120) & (r > g * 1.10) & (r > b * 1.10) & (sat > 25) & (yy < 0.53) & object_mask
+        white = (maxc > 160) & (sat < 82) & object_mask
+        yellow = (r > 105) & (g > 60) & (b < 170) & (r > b * 1.08) & (g > b * 0.82) & object_mask
+
+        def clean(mask: np.ndarray, component_min_area: int | None = None) -> np.ndarray:
+            component_min_area = max(1, int(component_min_area or min_area))
+            comps = connected_components_from_mask(mask.astype(bool), component_min_area)
+            if not comps:
+                return np.zeros_like(mask, dtype=bool)
+            return np.logical_or.reduce(comps).astype(bool)
+
+        plate = np.zeros_like(object_mask, dtype=bool)
+        if plate_items:
+            plate_seed = white & (yy > 0.52)
+            plate_comps = connected_components_from_mask(plate_seed, min_area)
+            kept = []
+            for comp in plate_comps:
+                bbox = mask_to_bbox(comp)
+                aspect = bbox.width / max(1, bbox.height)
+                if bbox.y2 / max(1, h) > 0.70 and aspect > 1.8:
+                    kept.append(comp)
+            if kept:
+                plate = clean(np.logical_or.reduce(kept), min_area)
+
+        toppings = clean(red, min_area)
+        frosting = clean(white & (yy < 0.70) & ~plate & ~toppings, min_area)
+
+        used_specific = plate | toppings | frosting
+        base_region = object_mask & ~used_specific & (yy > 0.30) & (yy < 0.86)
+        base = clean((yellow & ~used_specific) | base_region, min_area)
+
+        object_area = max(1, int(object_mask.sum()))
+        refined = {
+            "plate": plate,
+            "collection": toppings,
+            "frosting": frosting,
+            "base": base,
+        }
+        if frosting.sum() < min_area or base.sum() < min_area:
+            return
+        if plate_items and plate.sum() < min_area:
+            return
+        if collection_items and toppings.sum() < min_area:
+            return
+        if sum(int(mask.sum()) for mask in refined.values()) < int(0.55 * object_area):
+            return
+
+        def apply_items(items: list[dict[str, Any]], mask: np.ndarray, tag: str) -> None:
+            if not items or mask.sum() < min_area:
+                return
+            item = items[0]
+            item["mask"] = mask.astype(bool)
+            ids = list(item.get("candidate_ids") or [])
+            cand = item.get("candidate")
+            if cand is not None and cand.candidate_id not in ids:
+                ids.append(cand.candidate_id)
+            ids.append(f"layout_refine:{tag}")
+            item["candidate_ids"] = ids
+            item.setdefault("log", {})["layout_refine"] = tag
+
+        apply_items(plate_items, plate, "plate")
+        apply_items(collection_items, toppings, "collection")
+        apply_items(frosting_items, frosting, "frosting")
+        apply_items(base_items, base, "base")
+
+    def _apply_spatial_priors(self, resolved: list[dict[str, Any]], object_mask: np.ndarray, min_area: int) -> None:
+        if not resolved:
+            return
+        object_bbox = mask_to_bbox(object_mask)
+        if object_bbox.is_empty:
+            return
+        object_area = max(1, int(object_mask.sum()))
+        lower_y = object_bbox.y1 + int(round(0.52 * object_bbox.height))
+        bottom_y = object_bbox.y1 + int(round(0.70 * object_bbox.height))
+        for item in resolved:
+            spec = item.get("spec")
+            if spec is None:
+                continue
+            mask = np.asarray(item.get("mask"), dtype=bool)
+            constrained = mask.copy()
+            applied = []
+
+            if self._is_bottom_support_prior(spec):
+                lower_mask = constrained.copy()
+                lower_mask[:lower_y, :] = False
+                comps = connected_components_from_mask(lower_mask, max(1, min_area // 2))
+                kept = []
+                for comp in comps:
+                    bbox = mask_to_bbox(comp)
+                    aspect = bbox.width / max(1, bbox.height)
+                    if bbox.y2 >= bottom_y and aspect >= 1.3:
+                        kept.append(comp)
+                if kept:
+                    constrained = np.logical_or.reduce(kept).astype(bool)
+                    applied.append("bottom_support")
+
+            if self._is_small_spatial_prior(spec):
+                candidate = constrained & self._expected_region_mask(spec, object_mask, object_bbox)
+                if candidate.sum() >= min_area:
+                    max_area = max(min_area, int(round(0.18 * object_area)))
+                    if self._is_thin_or_label_prior(spec):
+                        max_area = max(min_area, int(round(0.12 * object_area)))
+                    comps = connected_components_from_mask(candidate, max(1, min_area // 3))
+                    if comps:
+                        comps.sort(key=lambda comp: int(comp.sum()), reverse=True)
+                        kept = []
+                        used_area = 0
+                        for comp in comps:
+                            area = int(comp.sum())
+                            if kept and used_area + area > max_area:
+                                continue
+                            kept.append(comp)
+                            used_area += area
+                            if used_area >= max_area:
+                                break
+                        if kept:
+                            constrained = np.logical_or.reduce(kept).astype(bool)
+                            applied.append("small_spatial_extent")
+
+            if not applied:
+                continue
+            if constrained.sum() < min_area:
+                continue
+            removed = int(mask.sum() - constrained.sum())
+            if removed <= 0:
+                continue
+            item["mask"] = constrained
+            item.setdefault("log", {})["spatial_prior"] = {
+                "type": "+".join(applied),
+                "removed_pixels": removed,
+                "object_bbox": object_bbox.to_dict(),
+            }
+            ids = list(item.get("candidate_ids") or [])
+            ids.append(f"spatial_prior:{'+'.join(applied)}")
+            item["candidate_ids"] = ids
+            self.logs["warnings"].append(f"Applied spatial prior {applied} to {spec.name}; removed {removed} leaked pixels.")
+
+    def _spec_text(self, spec: PartSpec) -> str:
+        return " ".join(
+            [
+                spec.name,
+                spec.physics_group or "",
+                spec.location,
+                spec.shape_prior,
+                spec.physical_role,
+                *list(spec.text_prompts or []),
+            ]
+        ).lower()
+
+    def _is_bottom_support_prior(self, spec: PartSpec) -> bool:
+        text = self._spec_text(spec)
+        if "main" in text and "body" in text:
+            return False
+        return any(
+            key in text
+            for key in (
+                "support",
+                "contact",
+                "underneath",
+                "resting",
+                "bottom support",
+                "plate",
+                "dish",
+                "stand",
+                "tray",
+                "sole",
+                "foot",
+                "feet",
+                "wheel",
+            )
+        )
+
+    def _is_small_spatial_prior(self, spec: PartSpec) -> bool:
+        text = self._spec_text(spec)
+        if is_collection_part(spec):
+            return False
+        return any(
+            key in text
+            for key in (
+                "small",
+                "tiny",
+                "thin",
+                "narrow",
+                "decoration",
+                "decorative",
+                "sign",
+                "card",
+                "label",
+                "flag",
+                "candle",
+                "lace",
+                "string",
+            )
+        )
+
+    def _is_thin_or_label_prior(self, spec: PartSpec) -> bool:
+        text = self._spec_text(spec)
+        return any(key in text for key in ("thin", "narrow", "sign", "card", "label", "flag", "lace", "string"))
+
+    def _expected_region_mask(self, spec: PartSpec, object_mask: np.ndarray, object_bbox: BBox) -> np.ndarray:
+        text = self._spec_text(spec)
+        region = object_mask.copy()
+        y1, y2 = object_bbox.y1, object_bbox.y2
+        x1, x2 = object_bbox.x1, object_bbox.x2
+        h = max(1, y2 - y1)
+        w = max(1, x2 - x1)
+        if any(key in text for key in ("top", "upper", "above")):
+            region[y1 + int(round(0.55 * h)) :, :] = False
+        if any(key in text for key in ("bottom", "lower", "under", "below")):
+            region[: y1 + int(round(0.35 * h)), :] = False
+        if "left" in text:
+            region[:, x1 + int(round(0.65 * w)) :] = False
+        if "right" in text:
+            region[:, : x1 + int(round(0.35 * w))] = False
+        return region
+
+    def _merge_collection_part(
+        self,
+        chosen: dict[str, Any],
+        scored_items: list[dict[str, Any]],
+        used: np.ndarray,
+        object_area: int,
+        min_area: int,
+    ) -> dict[str, Any]:
+        merged = chosen["mask"].copy()
+        cand = chosen.get("candidate")
+        candidate_ids = [cand.candidate_id] if cand is not None else []
+        base_score = float(chosen.get("score", 0.0))
+        for item in scored_items:
+            other = item.get("candidate")
+            if other is None or other.candidate_id in candidate_ids:
+                continue
+            if item.get("score", 0.0) < max(self.min_accept_score, base_score - 0.18):
+                continue
+            if other.source not in SAM_LIKE_SOURCES:
+                continue
+            mask = item["mask"].copy()
+            mask[used | merged] = False
+            if mask.sum() < min_area:
+                continue
+            merged |= mask
+            candidate_ids.append(other.candidate_id)
+            if merged.sum() / max(1, object_area) >= 0.10 or len(candidate_ids) >= 6:
+                break
+        if len(candidate_ids) > 1:
+            chosen = dict(chosen)
+            chosen["mask"] = merged
+            chosen["candidate_ids"] = candidate_ids
+            chosen.setdefault("log", {})["merged_candidate_ids"] = candidate_ids
+        return chosen
 
     def _apply_residual_policy(self, resolved: list[dict[str, Any]], object_mask: np.ndarray, min_area: int) -> None:
         if not resolved:
@@ -524,7 +857,19 @@ class SegmentationAgent:
         center_arr = np.asarray(centers, dtype=np.float32)
         dx = rxs[:, None].astype(np.float32) - center_arr[None, :, 0]
         dy = rys[:, None].astype(np.float32) - center_arr[None, :, 1]
-        labels = np.argmin(dx * dx + dy * dy, axis=1)
+        dist = dx * dx + dy * dy
+        object_bbox = mask_to_bbox(object_mask)
+        if not object_bbox.is_empty:
+            lower_y = object_bbox.y1 + int(round(0.52 * object_bbox.height))
+            for idx, item in enumerate(resolved):
+                spec = item.get("spec")
+                if spec is not None and self._is_bottom_support_prior(spec):
+                    dist[rys < lower_y, idx] = np.inf
+        finite = np.isfinite(dist).any(axis=1)
+        labels = np.argmin(np.where(np.isfinite(dist), dist, np.inf), axis=1)
+        if not np.all(finite):
+            fallback_dist = dx[~finite] * dx[~finite] + dy[~finite] * dy[~finite]
+            labels[~finite] = np.argmin(fallback_dist, axis=1)
         for idx, item in enumerate(resolved):
             take = labels == idx
             count = int(take.sum())
@@ -537,20 +882,44 @@ class SegmentationAgent:
     def _quality_report(self, parts: list[PartInstance], specs: list[PartSpec], object_mask: np.ndarray, min_area: int) -> dict[str, Any]:
         names = {p.name for p in parts if p.name != "unknown_body"}
         expected = [s.name for s in specs if s.visible]
+        specs_by_name = {s.name: s for s in specs}
         missing = [name for name in expected if name not in names]
         masks = [read_mask(p.mask_path) & object_mask for p in parts]
         union = np.logical_or.reduce(masks) if masks else np.zeros_like(object_mask, dtype=bool)
-        coverage = float(union.sum() / max(1, object_mask.sum()))
+        object_area = max(1, object_mask.sum())
+        coverage = float(union.sum() / object_area)
         pair_overlap = 0
         for i in range(len(masks)):
             for j in range(i + 1, len(masks)):
                 pair_overlap += int(np.logical_and(masks[i], masks[j]).sum())
-        overlap_ratio = float(pair_overlap / max(1, object_mask.sum()))
+        overlap_ratio = float(pair_overlap / object_area)
         tiny = [p.name for p in parts if p.area < min_area]
-        ok = coverage >= self.coverage_threshold and not tiny and overlap_ratio <= 0.20
+        semantic_issues = []
+        unknown_ratio = 0.0
+        for part in parts:
+            area_ratio = float(part.area / object_area)
+            if part.name == "unknown_body":
+                unknown_ratio += area_ratio
+                continue
+            spec = specs_by_name.get(part.name)
+            if spec is None:
+                continue
+            if is_plate_like_part(spec) and area_ratio > 0.40:
+                semantic_issues.append(f"{part.name}:oversized_plate")
+            if is_collection_part(spec) and area_ratio < 0.05:
+                semantic_issues.append(f"{part.name}:single_or_tiny_collection")
+            if is_frosting_like_part(spec) and area_ratio < 0.08:
+                semantic_issues.append(f"{part.name}:tiny_layer")
+        if unknown_ratio > 0.12:
+            semantic_issues.append("unknown_body:large_residual")
+        ok = coverage >= self.coverage_threshold and not tiny and overlap_ratio <= 0.20 and not missing and not semantic_issues
         reason = "ok"
         if tiny:
             reason = "tiny_selected_parts"
+        elif missing:
+            reason = "missing_expected_parts"
+        elif semantic_issues:
+            reason = "semantic_quality_issues"
         elif overlap_ratio > 0.20:
             reason = "high_overlap"
         elif coverage < self.coverage_threshold:
@@ -565,6 +934,8 @@ class SegmentationAgent:
             "coverage": coverage,
             "overlap_ratio": overlap_ratio,
             "tiny_parts": tiny,
+            "semantic_issues": semantic_issues,
+            "unknown_ratio": unknown_ratio,
             "accepted_with_warnings": bool(not ok or missing),
             "strict_segmentation": self.strict_segmentation,
             "residual_policy": self.residual_policy,

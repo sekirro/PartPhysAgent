@@ -43,9 +43,11 @@ from .material_table import (
     normalize_material_name,
 )
 from .physgm_runner import PhysGMRunner, _find_physgm_root, _resolve_path
+from .part_seg_agent import PartSegAgentController
 from .proposals import generate_object_mask, generate_part_candidates
 from .report import write_json, write_warnings
 from .sam_tool import create_sam_tool
+from .scene_builder import VIEW_LABELS, _candidate_multiview_paths
 from .selector import select_physical_parts
 from .sim_config_builder import build_part_aware_sim_config
 from .segmentation_agent import SegmentationAgent
@@ -62,6 +64,16 @@ def _get(config, key: str, default=None):
 def _safe_name(name: str) -> str:
     value = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(name).strip().lower())
     return value.strip("_") or "part"
+
+
+def _part_key(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(name).lower())
+
+
+def _is_residual_part(part: PartInstance) -> bool:
+    name = str(getattr(part, "name", "")).lower()
+    group = str(getattr(part, "physics_group", "") or (getattr(part, "metadata", {}) or {}).get("physics_group", "")).lower()
+    return name in {"unknown_body", "unknown", "residual", "residual_body"} or "residual" in name or group in {"global_body", "unknown", "residual"}
 
 
 def _write_json(path, data):
@@ -494,6 +506,224 @@ class PartPhysAgent:
         save_rgb(white_full, input_dir / "object_isolated_full.png")
         return str(input_dir / "object_isolated_full.png")
 
+    def _run_segmentation_agent(
+        self,
+        image_path,
+        object_mask_path,
+        object_bbox,
+        schema,
+        detector,
+        sam,
+        vlm,
+        output_dir,
+        candidates_dir,
+        overrides: dict[str, Any] | None = None,
+    ):
+        overrides = overrides or {}
+
+        def cfg(key: str, default=None):
+            return overrides[key] if key in overrides else _get(self.config, key, default)
+
+        return SegmentationAgent(
+            image_path=image_path,
+            object_mask_path=object_mask_path,
+            object_bbox=object_bbox,
+            part_schema=schema,
+            detector=detector,
+            sam_tool=sam,
+            vlm_client=vlm,
+            output_dir=output_dir,
+            candidates_dir=candidates_dir,
+            max_parts=int(cfg("max_parts", 6)),
+            min_part_area_ratio=float(cfg("min_part_area_ratio", 0.01)),
+            coverage_threshold=float(cfg("coverage_threshold", 0.75)),
+            max_retries=int(cfg("segmentation_max_retries", 2)),
+            vlm_weight=float(cfg("segmentation_vlm_weight", 0.55)),
+            min_accept_score=float(cfg("segmentation_min_accept_score", 0.45)),
+            max_vlm_candidates_per_part=int(cfg("max_vlm_candidates_per_part", 12)),
+            segmentation_mode=cfg("segmentation_mode", "candidate_pool"),
+            use_vlm_bbox_proposals=bool(cfg("use_vlm_bbox_proposals", False)),
+            use_schema_location_proposals=bool(cfg("use_schema_location_proposals", False)),
+            strict_segmentation=bool(cfg("strict_segmentation", False)),
+            residual_policy=cfg("residual_policy", "unknown"),
+            candidate_top_k=int(cfg("candidate_top_k", 40)),
+            candidate_contact_sheet_top_k=int(cfg("candidate_contact_sheet_top_k", 24)),
+        ).run()
+
+    def _refresh_part_summaries(self, scene_dir: Path, parts: list[PartInstance]) -> None:
+        for part in parts:
+            _write_json(Path(part.mask_path).parent / "part_summary.json", {"part": part.to_dict()})
+        summary_path = scene_dir / "parts" / "selection_summary.json"
+        try:
+            summary = _load_json(summary_path) if summary_path.exists() else {}
+        except Exception:
+            summary = {}
+        summary["parts"] = [p.to_dict() for p in parts]
+        _write_json(summary_path, summary)
+
+    def _attach_multiview_part_masks(
+        self,
+        parts: list[PartInstance],
+        schema: dict[str, Any],
+        image_path: str,
+        object_name: str,
+        detector,
+        sam,
+        vlm,
+        scene_dir: Path,
+        part_agent=None,
+    ) -> dict[str, Any]:
+        multiview_dir = _get(self.config, "multiview_dir")
+        view_paths = _candidate_multiview_paths(multiview_dir)
+        if not view_paths:
+            return {"enabled": False, "reason": "no_multiview_dir"}
+
+        for part in parts:
+            part.metadata.setdefault("view_masks", {})
+            part.metadata.setdefault("view_part_summaries", {})
+
+        parts_by_name = {_part_key(part.name): part for part in parts}
+        summary: dict[str, Any] = {
+            "enabled": True,
+            "multiview_dir": str(multiview_dir),
+            "view_labels": list(VIEW_LABELS),
+            "views": [],
+            "alignment": "part_schema_name",
+            "warnings": [],
+        }
+        canonical_path = Path(image_path).expanduser().resolve()
+
+        for label, view_path in zip(VIEW_LABELS, view_paths):
+            view_path = Path(view_path).expanduser().resolve()
+            if view_path == canonical_path:
+                for part in parts:
+                    part.metadata["view_masks"][label] = part.mask_path
+                    part.metadata["view_part_summaries"][label] = {
+                        "source": "canonical",
+                        "area": part.area,
+                        "bbox": part.bbox.to_dict(),
+                        "confidence": part.confidence,
+                    }
+                summary["views"].append({"label": label, "image_path": str(view_path), "source": "canonical", "matched_parts": [p.name for p in parts]})
+                continue
+
+            view_object_dir = scene_dir / "multiview_object" / label
+            view_candidates_dir = scene_dir / "multiview_candidates" / label
+            view_output_dir = scene_dir / "multiview_parts" / label
+            try:
+                view_object_mask_path, view_object_bbox, object_warnings = generate_object_mask(
+                    view_path,
+                    object_name,
+                    detector,
+                    sam,
+                    view_object_dir,
+                    fallback_to_full_image=bool(_get(self.config, "fallback_to_full_image", True)),
+                )
+                for warning in object_warnings:
+                    summary["warnings"].append(f"{label}: {warning}")
+                    self.warnings.append(f"{label}: {warning}")
+            except Exception as exc:
+                warning = f"Multiview segmentation failed for {label}: {exc}"
+                summary["warnings"].append(warning)
+                self.warnings.append(warning)
+                continue
+
+            view_parts = []
+            view_quality = {}
+            view_critique = None
+            view_round_records = []
+            view_rounds = part_agent.max_rounds if part_agent and getattr(part_agent, "enabled", False) else 1
+            final_view_output_dir = view_output_dir
+            for round_idx in range(view_rounds):
+                overrides = part_agent.round_overrides(view_critique, round_idx, {"stage": "multiview", "view": label}) if part_agent else {}
+                round_output_dir = view_output_dir if round_idx == 0 else scene_dir / "agent_rounds" / "multiview" / label / f"round_{round_idx:02d}"
+                round_candidates_dir = view_candidates_dir if round_idx == 0 else round_output_dir / "candidates"
+                try:
+                    view_parts, _, raw_quality = self._run_segmentation_agent(
+                        image_path=str(view_path),
+                        object_mask_path=view_object_mask_path,
+                        object_bbox=view_object_bbox,
+                        schema=schema,
+                        detector=detector,
+                        sam=sam,
+                        vlm=vlm,
+                        output_dir=round_output_dir,
+                        candidates_dir=round_candidates_dir,
+                        overrides=overrides,
+                    )
+                    final_view_output_dir = round_output_dir
+                except Exception as exc:
+                    view_quality = {"ok": False, "reason": f"view segmentation failed: {exc}", "missing_parts": [p.name for p in parts]}
+                    view_critique = {"ok": False, "failure_modes": [view_quality["reason"]], "repair_actions": [{"action": "increase_candidate_pool", "target": label}], "notes": []}
+                    view_round_records.append({"round": round_idx, "ok": False, "quality": view_quality, "critique": view_critique, "overrides": overrides})
+                    break
+
+                view_by_name = {_part_key(part.name): part for part in view_parts}
+                missing = [part.name for part in parts if not _is_residual_part(part) and _part_key(part.name) not in view_by_name]
+                view_quality = dict(raw_quality or {})
+                if missing:
+                    view_quality["ok"] = False
+                    view_quality["reason"] = "missing_aligned_parts"
+                    view_quality["missing_parts"] = sorted(set((view_quality.get("missing_parts") or []) + missing))
+                overlay_path = round_output_dir / "parts" / "parts_overlay.png"
+                view_critique = part_agent.critique(view_parts, view_quality, overlay_path, round_idx) if part_agent else {"ok": bool(view_quality.get("ok", True))}
+                view_round_records.append(
+                    {
+                        "round": round_idx,
+                        "output_dir": str(round_output_dir),
+                        "candidates_dir": str(round_candidates_dir),
+                        "overrides": overrides,
+                        "quality": view_quality,
+                        "critique": view_critique,
+                    }
+                )
+                if not (part_agent and part_agent.should_retry(view_critique, view_quality, round_idx)):
+                    break
+
+            view_by_name = {_part_key(part.name): part for part in view_parts}
+            matched = []
+            missing = []
+            for part in parts:
+                view_part = view_by_name.get(_part_key(part.name))
+                if view_part is None:
+                    if _is_residual_part(part):
+                        continue
+                    missing.append(part.name)
+                    continue
+                part.metadata["view_masks"][label] = view_part.mask_path
+                part.metadata["view_part_summaries"][label] = {
+                    "source": "multiview_segmentation",
+                    "area": view_part.area,
+                    "bbox": view_part.bbox.to_dict(),
+                    "confidence": view_part.confidence,
+                    "candidate_ids": list(view_part.candidate_ids),
+                }
+                matched.append(part.name)
+            if missing:
+                warning = f"{label}: missing aligned masks for {', '.join(missing)}"
+                summary["warnings"].append(warning)
+                self.warnings.append(warning)
+            if not view_quality.get("ok"):
+                warning = f"{label}: multiview segmentation accepted with warnings: {view_quality.get('reason')}"
+                summary["warnings"].append(warning)
+                self.warnings.append(warning)
+            summary["views"].append(
+                {
+                    "label": label,
+                    "image_path": str(view_path),
+                    "source": "multiview_segmentation",
+                    "quality": view_quality,
+                    "agent_rounds": view_round_records,
+                    "matched_parts": matched,
+                    "missing_parts": missing,
+                    "view_parts_dir": str(final_view_output_dir / "parts"),
+                }
+            )
+
+        _write_json(scene_dir / "agent_logs" / "multiview_segmentation_summary.json", summary)
+        self._refresh_part_summaries(scene_dir, parts)
+        return summary
+
 
     def _load_whole_physgm_result(self, whole_dir) -> PhysGMResult:
         whole_dir = Path(whole_dir).expanduser().resolve()
@@ -589,37 +819,61 @@ class PartPhysAgent:
             schema = vlm.generate_part_schema(image_path, object_name, str(object_mask_path))
         schema = normalize_part_schema(schema, object_name)
         _write_json(schema_dir / "part_schema.json", schema)
+        agent_view_paths = _candidate_multiview_paths(_get(self.config, "multiview_dir"))
+        part_agent = PartSegAgentController(self.config, scene_dir, vlm, object_name, image_path, agent_view_paths)
+        agent_plan = part_agent.plan(schema)
+        if (
+            part_agent.enabled
+            and not manual_parts
+            and not _get(self.config, "part_schema_json")
+            and isinstance(agent_plan.get("parts"), list)
+            and agent_plan.get("parts")
+        ):
+            schema = normalize_part_schema(
+                {
+                    "object": agent_plan.get("object") or object_name,
+                    "parts": agent_plan.get("parts", []),
+                    "relations": agent_plan.get("relations", []),
+                },
+                object_name,
+            )
+            _write_json(schema_dir / "part_schema.json", schema)
+            _write_json(schema_dir / "agent_plan.json", agent_plan)
 
         if manual_parts:
             parts = self._manual_part_instances(manual, object_mask_path, scene_dir, image_path, schema)
         else:
-            parts, _, quality = SegmentationAgent(
-                image_path=image_path,
-                object_mask_path=object_mask_path,
-                object_bbox=object_bbox,
-                part_schema=schema,
-                detector=detector,
-                sam_tool=sam,
-                vlm_client=vlm,
-                output_dir=scene_dir,
-                candidates_dir=candidates_dir,
-                max_parts=int(_get(self.config, "max_parts", 6)),
-                min_part_area_ratio=float(_get(self.config, "min_part_area_ratio", 0.01)),
-                coverage_threshold=float(_get(self.config, "coverage_threshold", 0.75)),
-                max_retries=int(_get(self.config, "segmentation_max_retries", 2)),
-                vlm_weight=float(_get(self.config, "segmentation_vlm_weight", 0.55)),
-                min_accept_score=float(_get(self.config, "segmentation_min_accept_score", 0.45)),
-                max_vlm_candidates_per_part=int(_get(self.config, "max_vlm_candidates_per_part", 12)),
-                segmentation_mode=_get(self.config, "segmentation_mode", "candidate_pool"),
-                use_vlm_bbox_proposals=bool(_get(self.config, "use_vlm_bbox_proposals", False)),
-                use_schema_location_proposals=bool(_get(self.config, "use_schema_location_proposals", False)),
-                strict_segmentation=bool(_get(self.config, "strict_segmentation", False)),
-                residual_policy=_get(self.config, "residual_policy", "unknown"),
-                candidate_top_k=int(_get(self.config, "candidate_top_k", 40)),
-                candidate_contact_sheet_top_k=int(_get(self.config, "candidate_contact_sheet_top_k", 24)),
-            ).run()
+            quality = {}
+            critique = None
+            rounds = part_agent.max_rounds if part_agent.enabled else 1
+            parts = []
+            for round_idx in range(rounds):
+                overrides = part_agent.round_overrides(critique, round_idx)
+                round_candidates_dir = candidates_dir if round_idx == 0 else scene_dir / "agent_rounds" / f"round_{round_idx:02d}" / "candidates"
+                parts, _, quality = self._run_segmentation_agent(
+                    image_path=image_path,
+                    object_mask_path=object_mask_path,
+                    object_bbox=object_bbox,
+                    schema=schema,
+                    detector=detector,
+                    sam=sam,
+                    vlm=vlm,
+                    output_dir=scene_dir,
+                    candidates_dir=round_candidates_dir,
+                    overrides=overrides,
+                )
+                overlay_path = scene_dir / "parts" / "parts_overlay.png"
+                critique = part_agent.critique(parts, quality, overlay_path, round_idx)
+                part_agent.record_round(round_idx, parts, quality, critique, overrides)
+                if not part_agent.should_retry(critique, quality, round_idx):
+                    break
             if not quality.get("ok"):
                 self.warnings.append(f"Segmentation accepted with warnings: {quality.get('reason')}")
+
+        multiview_summary = self._attach_multiview_part_masks(parts, schema, image_path, object_name, detector, sam, vlm, scene_dir, part_agent)
+        multiview_critique = part_agent.record_multiview_summary(multiview_summary, parts)
+        if multiview_critique and not multiview_critique.get("ok", True):
+            self.warnings.append("Agent multiview critic accepted result with warnings.")
 
         if bool(_get(self.config, "mask_only", False)):
             self.warnings.append("Mask-only mode; stopped after object mask and part masks.")
@@ -712,7 +966,18 @@ class PartPhysAgent:
         if assignment_mode != "none" and whole_result.point_cloud_path and Path(whole_result.point_cloud_path).exists():
             positions = load_ply_positions(whole_result.point_cloud_path)
             if assignment_mode == "projection":
-                part_masks = [{"part_id": p.part_id, "mask_path": p.mask_path, "area": p.area, "confidence": p.confidence} for p in parts]
+                part_masks = [
+                    {
+                        "part_id": p.part_id,
+                        "name": p.name,
+                        "mask_path": p.mask_path,
+                        "view_masks": p.metadata.get("view_masks", {}),
+                        "area": p.area,
+                        "confidence": p.confidence,
+                        "physics_group": p.physics_group,
+                    }
+                    for p in parts
+                ]
                 assign = assign_by_projection(positions, part_masks, whole_dir / "input_batch_meta.npz", image.size)
                 if assign.get("assigned_ratio", 0.0) < 0.05 and bool(_get(self.config, "fallback_to_aabb_heuristic", True)):
                     self.warnings.append("Projection assignment ratio too low; falling back to AABB heuristic.")
@@ -736,6 +1001,16 @@ class PartPhysAgent:
                 {
                     "assigned_ratio": assign.get("assigned_ratio", 0.0),
                     "per_part_counts": assign.get("per_part_counts", {}),
+                    "projection_views": assign.get("view_labels", []),
+                    "projection_view_hits": assign.get("per_view_hits", {}),
+                    "projection_image_size": assign.get("projection_image_size"),
+                    "projection_mean_view_support": assign.get("mean_view_support"),
+                    "projection_view_support_counts": assign.get("view_support_counts", {}),
+                    "projection_margin_ratio": assign.get("margin_ratio", {}),
+                    "projection_low_confidence_count": assign.get("low_confidence_count", 0),
+                    "projection_smoothed_count": assign.get("smoothed_count", 0),
+                    "projection_knn_unknown_reassigned_count": assign.get("knn_unknown_reassigned_count", 0),
+                    "projection_knn_island_reassigned_count": assign.get("knn_island_reassigned_count", 0),
                     "aabb_count": len(part_aabbs),
                     "warnings": assign.get("warnings", []),
                 }
