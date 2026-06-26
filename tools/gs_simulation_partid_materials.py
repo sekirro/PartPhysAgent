@@ -207,13 +207,6 @@ def load_part_material_table(path, material_params):
             "E": float(merged["E"]),
             "nu": float(merged["nu"]),
             "density": float(merged["density"]),
-            "rigid_project": bool(merged.get("rigid_project", False)),
-            "rigid_project_strength": float(merged.get("rigid_project_strength", 1.0)),
-            "interface_bond": bool(merged.get("interface_bond", False)),
-            "interface_bond_radius": float(merged.get("interface_bond_radius", 0.035)),
-            "interface_bond_strength": float(merged.get("interface_bond_strength", 0.75)),
-            "interface_bond_velocity_blend": float(merged.get("interface_bond_velocity_blend", 0.75)),
-            "interface_bond_max_particles": int(merged.get("interface_bond_max_particles", 25000)),
         }
     return table, fallback
 
@@ -264,164 +257,6 @@ def apply_direct_part_materials(mpm_solver, particle_part_ids, materials_json, m
     print("Applied direct per-particle part materials")
     print(json.dumps(summary, indent=2))
     return table, fallback
-
-
-class RigidPartProjector:
-    def __init__(self, init_pos, particle_part_ids, material_table, output_path=None, device="cuda:0"):
-        self.groups = []
-        part_ids = torch.as_tensor(particle_part_ids, dtype=torch.long, device=device)
-        init_pos = init_pos.detach().to(device=device)
-        summary = {"mode": "frame_level_translation_shape_projection", "parts": {}}
-        for pid, params in sorted(material_table.items()):
-            if not bool(params.get("rigid_project", False)):
-                continue
-            mask = part_ids == int(pid)
-            count = int(mask.sum().item())
-            if count <= 0:
-                continue
-            part_init = init_pos[mask].clone()
-            init_com = part_init.mean(dim=0)
-            self.groups.append(
-                {
-                    "part_id": int(pid),
-                    "name": params.get("name", f"part_{pid}"),
-                    "mask": mask,
-                    "offsets": part_init - init_com.reshape(1, 3),
-                    "count": count,
-                    "strength": min(max(float(params.get("rigid_project_strength", 1.0)), 0.0), 1.0),
-                }
-            )
-            summary["parts"][str(pid)] = {
-                "name": params.get("name", f"part_{pid}"),
-                "particle_count": count,
-                "material": params.get("material"),
-                "E": params.get("E"),
-                "strength": min(max(float(params.get("rigid_project_strength", 1.0)), 0.0), 1.0),
-            }
-        if output_path is not None and self.groups:
-            with open(os.path.join(output_path, "rigid_projection_summary.json"), "w", encoding="utf-8") as f:
-                json.dump(summary, f, indent=2)
-        if self.groups:
-            print("Rigid part projection enabled")
-            print(json.dumps(summary, indent=2))
-
-    def project(self, mpm_solver, device="cuda:0"):
-        if not self.groups:
-            return
-        with torch.no_grad():
-            x = mpm_solver.export_particle_x_to_torch().clone()
-            v = mpm_solver.export_particle_v_to_torch().clone()
-            F = mpm_solver.export_particle_F_to_torch().reshape(-1, 3, 3).clone()
-            C = mpm_solver.export_particle_C_to_torch().reshape(-1, 3, 3).clone()
-            eye = torch.eye(3, device=x.device, dtype=x.dtype).reshape(1, 3, 3)
-            zero = torch.zeros((1, 3, 3), device=x.device, dtype=x.dtype)
-            for group in self.groups:
-                mask = group["mask"]
-                current_com = x[mask].mean(dim=0)
-                mean_v = v[mask].mean(dim=0)
-                strength = float(group.get("strength", 1.0))
-                target_x = current_com.reshape(1, 3) + group["offsets"]
-                x[mask] = x[mask] * (1.0 - strength) + target_x * strength
-                v[mask] = v[mask] * (1.0 - strength) + mean_v.reshape(1, 3) * strength
-                F[mask] = F[mask] * (1.0 - strength) + eye * strength
-                C[mask] = C[mask] * (1.0 - strength) + zero * strength
-            mpm_solver.import_particle_x_from_torch(x, clone=False, device=device)
-            mpm_solver.import_particle_v_from_torch(v, clone=False, device=device)
-            mpm_solver.import_particle_F_from_torch(F, clone=False, device=device)
-            mpm_solver.import_particle_C_from_torch(C, clone=False, device=device)
-
-
-class BondedInterfaceProjector:
-    def __init__(self, init_pos, particle_part_ids, material_table, output_path=None, device="cuda:0"):
-        self.groups = []
-        part_ids_np = np.asarray(particle_part_ids, dtype=np.int32)
-        init_np = init_pos.detach().cpu().numpy().astype(np.float32)
-        init_torch = init_pos.detach().to(device=device)
-        part_ids_torch = torch.as_tensor(part_ids_np, dtype=torch.long, device=device)
-        support_ids = {
-            int(pid)
-            for pid, params in material_table.items()
-            if bool(params.get("interface_bond", False))
-        }
-        if not support_ids:
-            return
-        summary = {"mode": "initial_contact_bond_projection", "parts": {}}
-        for pid in sorted(support_ids):
-            params = material_table[pid]
-            support_idx = np.where(part_ids_np == int(pid))[0]
-            if len(support_idx) == 0:
-                continue
-            candidate_idx = np.where((part_ids_np >= 0) & (part_ids_np != int(pid)))[0]
-            if len(candidate_idx) == 0:
-                continue
-            radius = max(1.0e-5, float(params.get("interface_bond_radius", 0.035)))
-            strength = min(max(float(params.get("interface_bond_strength", 0.75)), 0.0), 1.0)
-            velocity_blend = min(max(float(params.get("interface_bond_velocity_blend", strength)), 0.0), 1.0)
-            max_particles = max(1, int(params.get("interface_bond_max_particles", 25000)))
-            tree = cKDTree(init_np[support_idx])
-            dist, _ = tree.query(init_np[candidate_idx], k=1, workers=-1)
-            order = np.argsort(dist)
-            near = candidate_idx[order][dist[order] <= radius]
-            if len(near) > max_particles:
-                near = near[:max_particles]
-            if len(near) == 0:
-                continue
-            support_mask = part_ids_torch == int(pid)
-            bond_mask = torch.zeros(len(part_ids_np), dtype=torch.bool, device=device)
-            bond_mask[torch.as_tensor(near, dtype=torch.long, device=device)] = True
-            support_init = init_torch[support_mask]
-            support_init_com = support_init.mean(dim=0)
-            bond_offsets = init_torch[bond_mask].clone() - support_init_com.reshape(1, 3)
-            self.groups.append(
-                {
-                    "part_id": int(pid),
-                    "name": params.get("name", f"part_{pid}"),
-                    "support_mask": support_mask,
-                    "bond_mask": bond_mask,
-                    "bond_offsets": bond_offsets,
-                    "strength": strength,
-                    "velocity_blend": velocity_blend,
-                    "count": int(len(near)),
-                    "radius": radius,
-                }
-            )
-            bonded_ids, bonded_counts = np.unique(part_ids_np[near], return_counts=True)
-            summary["parts"][str(pid)] = {
-                "name": params.get("name", f"part_{pid}"),
-                "support_particle_count": int(len(support_idx)),
-                "bond_particle_count": int(len(near)),
-                "radius": radius,
-                "strength": strength,
-                "velocity_blend": velocity_blend,
-                "bonded_part_counts": {str(int(k)): int(v) for k, v in zip(bonded_ids, bonded_counts)},
-            }
-        if output_path is not None and self.groups:
-            with open(os.path.join(output_path, "interface_bond_summary.json"), "w", encoding="utf-8") as f:
-                json.dump(summary, f, indent=2)
-        if self.groups:
-            print("Bonded interface projection enabled")
-            print(json.dumps(summary, indent=2))
-
-    def project(self, mpm_solver, device="cuda:0"):
-        if not self.groups:
-            return
-        with torch.no_grad():
-            x = mpm_solver.export_particle_x_to_torch().clone()
-            v = mpm_solver.export_particle_v_to_torch().clone()
-            for group in self.groups:
-                support_mask = group["support_mask"]
-                bond_mask = group["bond_mask"]
-                if int(support_mask.sum().item()) == 0 or int(bond_mask.sum().item()) == 0:
-                    continue
-                support_com = x[support_mask].mean(dim=0)
-                support_v = v[support_mask].mean(dim=0)
-                target = support_com.reshape(1, 3) + group["bond_offsets"]
-                strength = float(group["strength"])
-                velocity_blend = float(group["velocity_blend"])
-                x[bond_mask] = x[bond_mask] * (1.0 - strength) + target * strength
-                v[bond_mask] = v[bond_mask] * (1.0 - velocity_blend) + support_v.reshape(1, 3) * velocity_blend
-            mpm_solver.import_particle_x_from_torch(x, clone=False, device=device)
-            mpm_solver.import_particle_v_from_torch(v, clone=False, device=device)
 
 
 ti.init(arch=ti.cuda, device_memory_GB=8.0)
@@ -681,24 +516,6 @@ if __name__ == "__main__":
             device,
         )
 
-    rigid_projector = None
-    bonded_interface_projector = None
-    if particle_part_ids is not None and part_material_table:
-        rigid_projector = RigidPartProjector(
-            mpm_init_pos,
-            particle_part_ids,
-            part_material_table,
-            output_path=args.output_path,
-            device=device,
-        )
-        bonded_interface_projector = BondedInterfaceProjector(
-            mpm_init_pos,
-            particle_part_ids,
-            part_material_table,
-            output_path=args.output_path,
-            device=device,
-        )
-
     # Note: boundary conditions may depend on mass, so the order cannot be changed!
     set_boundary_conditions(mpm_solver, bc_params, time_params)
 
@@ -769,10 +586,6 @@ if __name__ == "__main__":
 
         for step in range(step_per_frame):
             mpm_solver.p2g2p(frame, substep_dt, device=device)
-        if rigid_projector is not None:
-            rigid_projector.project(mpm_solver, device=device)
-        if bonded_interface_projector is not None:
-            bonded_interface_projector.project(mpm_solver, device=device)
 
         if args.output_ply or args.output_h5:
             save_data_at_frame(
