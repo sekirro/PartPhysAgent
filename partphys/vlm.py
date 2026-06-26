@@ -6,9 +6,10 @@ import os
 import re
 import socket
 import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any
+
+from openai import OpenAI, OpenAIError
 
 from .material_table import normalize_material_name
 from .prompts import (
@@ -373,25 +374,19 @@ class OpenAICompatibleVLMClient(BaseVLMClient):
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
         if image_path:
             content.append({"type": "image_url", "image_url": {"url": self._image_url(image_path)}})
-        payload = json.dumps(
-            {
-                "model": self.model,
-                "messages": [{"role": "user", "content": content}],
-                "temperature": 0,
-            }
-        ).encode("utf-8")
-        req = urllib.request.Request(
-            f"{self.api_base}/chat/completions",
-            data=payload,
-            headers={
-                "Authorization": f"Bearer {key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        text = data["choices"][0]["message"]["content"]
+        client = OpenAI(api_key=key, base_url=self.api_base, timeout=self.timeout)
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": content}],
+            "temperature": 0,
+        }
+        if self.model.lower().startswith("qwen") or "aliyuncs.com" in self.api_base:
+            kwargs["extra_body"] = {"enable_thinking": False}
+        try:
+            completion = client.chat.completions.create(**kwargs)
+            text = completion.choices[0].message.content or ""
+        except (OpenAIError, AttributeError, IndexError) as exc:
+            raise RuntimeError(f"VLM OpenAI-compatible call failed: {exc}") from exc
         return self._extract_json(text)
 
     def _fallback_on_error(self, method: str, error: Exception, *args):

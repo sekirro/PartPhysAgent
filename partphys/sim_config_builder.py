@@ -12,37 +12,14 @@ from .types import PhysicsParams, PhysGMResult, PartInstance
 
 def _solver_safe_global_values(material: str, E: float, nu: float, density: float, warnings: list[str]):
     solver_material = material_to_solver_material(material)
-    if solver_material == "metal":
-        warnings.append(
-            f"Simulation solver material for {material} remapped from metal to plasticine for Warp stability."
-        )
-        solver_material = "plasticine"
-        safe_E = min(max(float(E), 1e3), 5e5)
-        safe_nu = min(max(float(nu), 0.25), 0.45)
-        safe_density = min(max(float(density), 100.0), 3000.0)
-    else:
-        safe_E = min(max(float(E), 1e3), 2e6)
-        safe_nu = min(max(float(nu), 0.05), 0.45)
-        safe_density = min(max(float(density), 50.0), 3000.0)
-    if safe_E != float(E):
-        warnings.append(f"Simulation E adjusted from {E:g} to {safe_E:g} for solver stability.")
-    if safe_nu != float(nu):
-        warnings.append(f"Simulation nu adjusted from {nu:g} to {safe_nu:g} for solver stability.")
-    if safe_density != float(density):
-        warnings.append(f"Simulation density adjusted from {density:g} to {safe_density:g} for solver stability.")
+    safe_E = float(E)
+    safe_nu = float(nu)
+    safe_density = float(density)
     return solver_material, safe_E, safe_nu, safe_density
 
 
 def _solver_safe_local_values(part_name: str, E: float, nu: float, density: float, warnings: list[str]):
-    safe_E = min(max(float(E), 1e3), 2e6)
-    safe_nu = min(max(float(nu), 0.05), 0.45)
-    safe_density = min(max(float(density), 50.0), 3000.0)
-    if safe_E != float(E) or safe_nu != float(nu) or safe_density != float(density):
-        warnings.append(
-            f"Simulation local params adjusted for {part_name}: "
-            f"E {E:g}->{safe_E:g}, nu {nu:g}->{safe_nu:g}, density {density:g}->{safe_density:g}."
-        )
-    return safe_E, safe_nu, safe_density
+    return float(E), float(nu), float(density)
 
 def _phys_values(phys: PhysicsParams | PhysGMResult | None):
     if phys is None:

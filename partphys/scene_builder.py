@@ -7,9 +7,6 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageEnhance, ImageOps
 
-from .image_utils import load_rgb, resize_to_square_with_padding, save_rgb
-
-
 FRAME_NAMES = ["000.png", "006.png", "012.png", "018.png"]
 VIEW_LABELS = ["front", "right", "rear", "left"]
 
@@ -43,15 +40,54 @@ def _load_template(template_pose_json: str | None):
 
 
 def _background_color(image: Image.Image) -> tuple[int, int, int]:
+    if "A" in image.getbands():
+        rgba = np.asarray(image.convert("RGBA"), dtype=np.float32)
+        alpha = rgba[..., 3] > 0
+        if alpha.any():
+            rgb = rgba[..., :3]
+            visible = rgb[alpha]
+            return tuple(int(x) for x in np.clip(visible.mean(axis=0), 0, 255))
     rgb = np.asarray(image.convert("RGB"), dtype=np.float32)
     samples = np.concatenate([rgb[:4, :4].reshape(-1, 3), rgb[:4, -4:].reshape(-1, 3), rgb[-4:, :4].reshape(-1, 3), rgb[-4:, -4:].reshape(-1, 3)], axis=0)
     return tuple(int(x) for x in np.clip(samples.mean(axis=0), 0, 255))
 
 
+def _load_physgm_image(path) -> Image.Image:
+    image = Image.open(path)
+    if "A" in image.getbands():
+        return image.convert("RGBA")
+    return image.convert("RGB")
+
+
+def _resize_to_square_for_physgm(image: Image.Image, size: int = 512, bg=(255, 255, 255)) -> Image.Image:
+    has_alpha = "A" in image.getbands()
+    mode = "RGBA" if has_alpha else "RGB"
+    image = image.convert(mode)
+    w, h = image.size
+    if w == 0 or h == 0:
+        color = (*bg, 0) if has_alpha else bg
+        return Image.new(mode, (size, size), color)
+    scale = min(size / float(w), size / float(h))
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    resized = image.resize((new_w, new_h), Image.BICUBIC)
+    color = (*bg, 0) if has_alpha else bg
+    canvas = Image.new(mode, (size, size), color)
+    canvas.paste(resized, ((size - new_w) // 2, (size - new_h) // 2))
+    return canvas
+
+
+def _save_physgm_image(image: Image.Image, path):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    mode = "RGBA" if "A" in image.getbands() else "RGB"
+    image.convert(mode).save(path)
+
+
 def _side_proxy(image: Image.Image, label: str) -> Image.Image:
     w, h = image.size
+    has_alpha = "A" in image.getbands()
     bg = _background_color(image)
-    canvas = Image.new("RGB", (w, h), bg)
+    canvas = Image.new("RGBA" if has_alpha else "RGB", (w, h), (*bg, 0) if has_alpha else bg)
     scale = 0.78
     side = image.resize((max(1, int(w * scale)), h), Image.Resampling.LANCZOS)
     if label == "left":
@@ -94,9 +130,9 @@ def _load_multiview_images(multiview_dir: str | None, size: int | None) -> tuple
         return None
     images = []
     for path in paths:
-        image = load_rgb(path)
+        image = _load_physgm_image(path)
         if size is not None:
-            image = resize_to_square_with_padding(image, int(size))
+            image = _resize_to_square_for_physgm(image, int(size))
         images.append(image)
     return images, [str(p) for p in paths]
 
@@ -154,9 +190,9 @@ def build_physgm_input_scene(
         view_images, source_paths = loaded_multiview
         view_source = multiview_source
     else:
-        image = load_rgb(image_path)
+        image = _load_physgm_image(image_path)
         if size is not None:
-            image = resize_to_square_with_padding(image, int(size))
+            image = _resize_to_square_for_physgm(image, int(size))
         if duplicate_single_image:
             view_images = _single_image_proxy_views(image)
             view_source = "single_image_proxy"
@@ -172,7 +208,7 @@ def build_physgm_input_scene(
         if image.size != (w, h):
             image = image.resize((w, h), Image.Resampling.LANCZOS)
         out = scene_dir / name
-        save_rgb(image, out)
+        _save_physgm_image(image, out)
         frame_paths.append(str(out))
         frame_records.append({"file_name": name, "view_label": label, "path": str(out)})
 
