@@ -39,6 +39,13 @@ def _load_template(template_pose_json: str | None):
         return json.load(f)
 
 
+def _multiview_pose_json(multiview_dir: str | None) -> str | None:
+    if not multiview_dir:
+        return None
+    path = Path(multiview_dir) / "pose.json"
+    return str(path) if path.exists() else None
+
+
 def _background_color(image: Image.Image) -> tuple[int, int, int]:
     if "A" in image.getbands():
         rgba = np.asarray(image.convert("RGBA"), dtype=np.float32)
@@ -143,14 +150,17 @@ def _write_pose_frames(template, frame_names: list[str], width: int, height: int
         for idx, frame_name in enumerate(frame_names):
             src = template["frames"][min(idx, len(template["frames"]) - 1)]
             frame = dict(src)
+            src_w = float(src.get("w", width) or width)
+            src_h = float(src.get("h", height) or height)
+            scale_x = float(width) / src_w if src_w > 0 else 1.0
+            scale_y = float(height) / src_h if src_h > 0 else 1.0
             frame["file_path"] = frame_name
             frame["h"] = height
             frame["w"] = width
-            scale = max(width, height)
-            frame["fx"] = float(scale)
-            frame["fy"] = float(scale)
-            frame["cx"] = float(width) / 2.0
-            frame["cy"] = float(height) / 2.0
+            frame["fx"] = float(src.get("fx", max(src_w, src_h))) * scale_x
+            frame["fy"] = float(src.get("fy", max(src_w, src_h))) * scale_y
+            frame["cx"] = float(src.get("cx", src_w / 2.0)) * scale_x
+            frame["cy"] = float(src.get("cy", src_h / 2.0)) * scale_y
             frames.append(frame)
         return frames, True
 
@@ -212,7 +222,8 @@ def build_physgm_input_scene(
         frame_paths.append(str(out))
         frame_records.append({"file_name": name, "view_label": label, "path": str(out)})
 
-    template = _load_template(template_pose_json)
+    pose_template_json = _multiview_pose_json(multiview_dir) or template_pose_json
+    template = _load_template(pose_template_json)
     frames, template_used = _write_pose_frames(template, FRAME_NAMES, w, h)
     pose = {"scene_name": scene_name, "frames": frames}
     pose_json = scene_dir / "pose.json"
@@ -230,7 +241,7 @@ def build_physgm_input_scene(
         "frame_names": FRAME_NAMES,
         "source_paths": source_paths,
         "frame_records": frame_records,
-        "pose_template": str(template_pose_json) if template_pose_json else None,
+        "pose_template": str(pose_template_json) if pose_template_json else None,
         "camera_template_used": template_used,
         "width": w,
         "height": h,

@@ -313,10 +313,15 @@ def assign_by_projection(positions, part_masks, camera_meta_npz, image_size) -> 
         mask_cache: dict[str, np.ndarray] = {}
         weight_cache: dict[str, np.ndarray] = {}
         view_count = min(len(c2ws), len(VIEW_LABELS))
+        non_residual_total = sum(1 for part in parts if int(part["part_id"]) not in residual_part_ids)
         for view_idx in range(view_count):
             label = VIEW_LABELS[view_idx]
-            available = any(_view_mask_value(part, label, view_idx) is not None for part in parts)
-            if not available:
+            available_parts = [part for part in parts if _view_mask_value(part, label, view_idx) is not None]
+            available_non_residual = [part for part in available_parts if int(part["part_id"]) not in residual_part_ids]
+            if not available_parts:
+                continue
+            if non_residual_total > 1 and len(available_non_residual) < 2:
+                warnings.append(f"Skipped {label} projection: masks available for only one non-residual label.")
                 continue
             fx, fy, cx, cy = _intrinsics_for_view(intr, view_idx)
             c2w = c2ws[view_idx]

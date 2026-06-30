@@ -488,6 +488,8 @@ if __name__ == "__main__":
         preprocessing_params,
         camera_params,
     ) = decode_param_json(args.config)
+    with open(args.config, "r", encoding="utf-8") as f:
+        raw_scene_config = json.load(f)
 
     # load gaussians
     print("Loading gaussians...")
@@ -601,6 +603,21 @@ if __name__ == "__main__":
         rotated_pos, preprocessing_params["scale"]
     )
     transformed_pos = shift2center111(transformed_pos)
+
+    floor_alignment = raw_scene_config.get("initial_floor_alignment")
+    if isinstance(floor_alignment, dict) and floor_alignment.get("enabled", False):
+        floor_y = float(floor_alignment.get("floor_y", 0.25))
+        target_clearance = float(floor_alignment.get("target_clearance", 0.25))
+        target_bottom_y = floor_y + target_clearance
+        current_bottom_y = torch.min(transformed_pos[:, 1])
+        shift_y = target_bottom_y - float(current_bottom_y.detach().cpu().item())
+        transformed_pos[:, 1] = transformed_pos[:, 1] + shift_y
+        print(
+            "Initial floor alignment: "
+            f"bottom_y={float(current_bottom_y.detach().cpu().item()):.6g}, "
+            f"floor_y={floor_y:.6g}, target_clearance={target_clearance:.6g}, "
+            f"shift_y={shift_y:.6g}"
+        )
 
     # modify covariance matrix accordingly
     init_cov = apply_cov_rotations(init_cov, rotation_matrices)

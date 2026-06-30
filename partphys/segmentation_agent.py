@@ -87,9 +87,9 @@ def _heuristic_bbox_from_spec(spec: PartSpec, object_bbox, width: int, height: i
 
     x1, x2 = ox1, ox2
     y1, y2 = oy1, oy2
-    if any(k in text for k in ("left", "handle", "grip")):
+    if "left" in text:
         x2 = ox1 + int(round(0.72 * ow))
-    if any(k in text for k in ("right", "front", "head", "tip", "end")):
+    if "right" in text:
         x1 = ox1 + int(round(0.52 * ow))
     if any(k in text for k in ("top", "upper")):
         y2 = oy1 + int(round(0.58 * oh))
@@ -501,6 +501,7 @@ class SegmentationAgent:
 
         self._refine_layered_layout(resolved, image, object_mask, min_area)
         self._apply_spatial_priors(resolved, object_mask, min_area)
+        self._repair_large_structural_residual(resolved, object_mask, min_area)
         self._apply_residual_policy(resolved, object_mask, min_area)
 
         parts: list[PartInstance] = []
@@ -684,6 +685,97 @@ class SegmentationAgent:
             ids.append(f"spatial_prior:{'+'.join(applied)}")
             item["candidate_ids"] = ids
             self.logs["warnings"].append(f"Applied spatial prior {applied} to {spec.name}; removed {removed} leaked pixels.")
+
+    def _repair_large_structural_residual(self, resolved: list[dict[str, Any]], object_mask: np.ndarray, min_area: int) -> None:
+        if len(resolved) < 2 or len(resolved) > 3:
+            return
+        object_area = max(1, int(object_mask.sum()))
+        union = np.zeros_like(object_mask, dtype=bool)
+        for item in resolved:
+            union |= np.asarray(item.get("mask"), dtype=bool)
+        residual_ratio = float((object_mask & ~union).sum() / object_area)
+        if residual_ratio < 0.70:
+            return
+
+        object_bbox = mask_to_bbox(object_mask)
+        if object_bbox.is_empty:
+            return
+        h, w = object_mask.shape
+        yy = np.arange(h, dtype=np.float32)[:, None]
+        y_norm = (yy - float(object_bbox.y1)) / max(1.0, float(object_bbox.height))
+
+        def structural_kind(spec: PartSpec) -> str | None:
+            name_text = " ".join([spec.name, spec.physics_group or "", *list(spec.text_prompts or [])]).lower()
+            text = self._spec_text(spec)
+            if any(key in name_text for key in ("handle", "grip", "stick", "shaft", "rod", "bar")):
+                return "long_lower"
+            if any(key in name_text for key in ("head", "impactor")):
+                return "top_compact"
+            if any(key in text for key in ("head", "top", "upper", "impact", "block", "rectangular", "compact")):
+                return "top_compact"
+            if any(key in text for key in ("handle", "grip", "stick", "shaft", "rod", "bar", "vertical", "cylinder", "long")):
+                return "long_lower"
+            if any(key in text for key in ("base", "bottom", "lower", "support")) and not is_plate_like_part(spec):
+                return "lower_body"
+            return None
+
+        structural_items = [(idx, item, structural_kind(item["spec"])) for idx, item in enumerate(resolved)]
+        kinds = {kind for _, _, kind in structural_items if kind}
+        if not (("top_compact" in kinds and "long_lower" in kinds) or ("top_compact" in kinds and "lower_body" in kinds)):
+            return
+
+        repaired: dict[int, np.ndarray] = {}
+        top_band = object_mask & (y_norm <= 0.30)
+        lower_band = object_mask & (y_norm >= 0.18)
+        used = np.zeros_like(object_mask, dtype=bool)
+        for idx, item, kind in structural_items:
+            if kind != "top_compact":
+                continue
+            comps = connected_components_from_mask(top_band, max(1, min_area // 2))
+            if comps:
+                comps.sort(key=lambda comp: int(comp.sum()), reverse=True)
+                mask = comps[0].astype(bool)
+            else:
+                mask = top_band
+            if mask.sum() >= min_area:
+                repaired[idx] = mask
+                used |= mask
+
+        for idx, item, kind in structural_items:
+            if kind not in {"long_lower", "lower_body"}:
+                continue
+            mask = lower_band & ~used
+            if mask.sum() < min_area:
+                continue
+            comps = connected_components_from_mask(mask, max(1, min_area // 2))
+            if comps:
+                comps.sort(key=lambda comp: int(comp.sum()), reverse=True)
+                mask = comps[0].astype(bool)
+            if mask.sum() >= min_area:
+                repaired[idx] = mask
+                used |= mask
+
+        if len(repaired) < 2:
+            return
+        repaired_area = int(np.logical_or.reduce(list(repaired.values())).sum())
+        if repaired_area < int(0.70 * object_area):
+            return
+        for idx, mask in repaired.items():
+            item = resolved[idx]
+            old_area = int(np.asarray(item.get("mask"), dtype=bool).sum())
+            item["mask"] = mask.astype(bool)
+            ids = list(item.get("candidate_ids") or [])
+            ids.append("structural_residual_repair")
+            item["candidate_ids"] = ids
+            item.setdefault("log", {})["structural_residual_repair"] = {
+                "old_area": old_area,
+                "new_area": int(mask.sum()),
+                "residual_ratio_before": residual_ratio,
+                "object_bbox": object_bbox.to_dict(),
+            }
+        self.logs["warnings"].append(
+            f"Applied structural residual repair; residual ratio before repair was {residual_ratio:.3f}."
+        )
 
     def _spec_text(self, spec: PartSpec) -> str:
         return " ".join(

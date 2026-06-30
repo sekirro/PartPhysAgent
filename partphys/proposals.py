@@ -227,7 +227,7 @@ def _foreground_from_corner_background(image) -> np.ndarray | None:
     return np.logical_or.reduce(comps).astype(bool)
 
 
-def _keep_central_object_components(mask: np.ndarray) -> np.ndarray:
+def _keep_central_object_components(mask: np.ndarray, keep_multi_components: bool = False) -> np.ndarray:
     h, w = mask.shape
     image_area = max(1, h * w)
     min_area = max(64, int(0.001 * image_area))
@@ -257,14 +257,17 @@ def _keep_central_object_components(mask: np.ndarray) -> np.ndarray:
     rows.sort(key=lambda x: x[0], reverse=True)
     best_score = rows[0][0]
     best_area = rows[0][1]
+    keep_score_ratio = 0.08 if keep_multi_components else 0.20
+    keep_area_ratio = 0.006 if keep_multi_components else 0.015
+    keep_best_area_ratio = 0.08 if keep_multi_components else 0.18
     kept = []
     for score, area, comp in rows:
-        if score >= best_score * 0.20 or area >= max(int(0.015 * image_area), int(0.18 * best_area)):
+        if score >= best_score * keep_score_ratio or area >= max(int(keep_area_ratio * image_area), int(keep_best_area_ratio * best_area)):
             kept.append(comp)
     return np.logical_or.reduce(kept).astype(bool) if kept else rows[0][2].astype(bool)
 
 
-def _refine_object_mask_with_background(image, selected_mask: np.ndarray) -> tuple[np.ndarray, list[str]]:
+def _refine_object_mask_with_background(image, selected_mask: np.ndarray, keep_multi_components: bool = False) -> tuple[np.ndarray, list[str]]:
     selected_mask = np.asarray(selected_mask, dtype=bool)
     h, w = selected_mask.shape
     image_area = max(1, h * w)
@@ -272,7 +275,7 @@ def _refine_object_mask_with_background(image, selected_mask: np.ndarray) -> tup
     foreground = _foreground_from_corner_background(image)
     foreground_object = None
     if foreground is not None:
-        foreground_object = _keep_central_object_components(foreground)
+        foreground_object = _keep_central_object_components(foreground, keep_multi_components=keep_multi_components)
         mask_area_ratio = float(selected_mask.sum() / image_area)
         bbox = mask_to_bbox(selected_mask)
         fg_bbox = mask_to_bbox(foreground_object)
@@ -300,7 +303,7 @@ def _refine_object_mask_with_background(image, selected_mask: np.ndarray) -> tup
             elif refined.sum() < selected_mask.sum() * 0.95:
                 warnings.append("Object mask intersected with corner-background foreground cleanup.")
         selected_mask = refined.astype(bool)
-    cleaned = _keep_central_object_components(selected_mask)
+    cleaned = _keep_central_object_components(selected_mask, keep_multi_components=keep_multi_components)
     if cleaned.sum() >= max(64, int(0.02 * image_area)) and cleaned.sum() < selected_mask.sum() * 0.98:
         warnings.append("Object mask cleaned by central connected components.")
         selected_mask = cleaned
@@ -332,6 +335,7 @@ def generate_object_mask(
     sam_tool,
     output_dir,
     fallback_to_full_image: bool = True,
+    keep_multi_components: bool = False,
 ) -> tuple[str, BBox, list[str]]:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -372,7 +376,7 @@ def generate_object_mask(
         selected_mask = np.ones((h, w), dtype=bool)
         warnings.append("Object tools unavailable; using full image as object mask.")
 
-    selected_mask, cleanup_warnings = _refine_object_mask_with_background(image, selected_mask)
+    selected_mask, cleanup_warnings = _refine_object_mask_with_background(image, selected_mask, keep_multi_components=keep_multi_components)
     warnings.extend(cleanup_warnings)
     bbox = mask_to_bbox(selected_mask)
     mask_path = output_dir / "object_mask.png"
