@@ -135,31 +135,6 @@ class PartInstance:
 
 
 @dataclass
-class ObjectInstance:
-    object_id: int
-    name: str
-    mask_path: str
-    bbox: BBox
-    area: int
-    confidence: float
-    part_ids: list[int] = field(default_factory=list)
-    warnings: list[str] = field(default_factory=list)
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self):
-        self.bbox = _coerce_bbox(self.bbox)
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "ObjectInstance":
-        item = _from_dict_dataclass(cls, data)
-        item.bbox = _coerce_bbox(item.bbox)
-        return item
-
-
-@dataclass
 class PhysicsParams:
     material: str
     material_confidence: float
@@ -211,7 +186,6 @@ class PartPhysResult:
     sim_config_path: Optional[str]
     simulation_output_dir: Optional[str]
     warnings: list[str] = field(default_factory=list)
-    objects: list[ObjectInstance] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -224,7 +198,6 @@ class PartPhysResult:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PartPhysResult":
         parts = [PartInstance.from_dict(p) for p in data.get("parts", [])]
-        objects = [ObjectInstance.from_dict(o) for o in data.get("objects", [])]
         part_physics = {
             int(k): PhysicsParams.from_dict(v)
             for k, v in data.get("part_physics", {}).items()
@@ -237,7 +210,6 @@ class PartPhysResult:
             object_name=data["object_name"],
             object_mask_path=data["object_mask_path"],
             parts=parts,
-            objects=objects,
             part_physics=part_physics,
             whole_physgm=whole,
             assignment_summary=data.get("assignment_summary", {}),

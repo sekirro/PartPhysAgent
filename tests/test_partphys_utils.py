@@ -14,7 +14,6 @@ from partphys.gaussian_assign import assign_by_aabb_heuristic, assign_by_project
 from partphys.image_utils import bbox_expand, mask_iou, mask_to_bbox, read_mask, save_mask
 from partphys.material_table import clamp_physics_to_material, normalize_material_name
 from partphys.multiview import split_mvadapter_grid
-from partphys.object_separation import separate_scene_objects
 from partphys.physgm_runner import PhysGMRunner
 from partphys.scene_builder import build_physgm_input_scene
 from partphys.segmentation_agent import SegmentationAgent
@@ -67,47 +66,6 @@ def test_crop_generation(tmp_path):
     assert set(crops) == {"tight", "padded", "context_dim", "isolated_full"}
     for path in crops.values():
         assert Image.open(path).size == (512, 512)
-
-
-def test_object_separation_from_part_masks(tmp_path):
-    image = np.full((64, 64, 3), 255, dtype=np.uint8)
-    image[8:36, 8:30] = [170, 170, 180]
-    image[28:56, 36:58] = [120, 120, 130]
-    image_path = tmp_path / "input.png"
-    Image.fromarray(image).save(image_path)
-
-    object_mask = np.zeros((64, 64), dtype=bool)
-    object_mask[8:36, 8:30] = True
-    object_mask[28:56, 36:58] = True
-    lid_mask = np.zeros((64, 64), dtype=bool)
-    lid_mask[8:36, 8:30] = True
-    body_mask = np.zeros((64, 64), dtype=bool)
-    body_mask[28:56, 36:58] = True
-    object_path = tmp_path / "object_mask.png"
-    lid_path = tmp_path / "lid.png"
-    body_path = tmp_path / "body.png"
-    save_mask(object_mask, object_path)
-    save_mask(lid_mask, lid_path)
-    save_mask(body_mask, body_path)
-
-    parts = [
-        PartInstance(0, "jar_lid", str(lid_path), mask_to_bbox(lid_mask), int(lid_mask.sum()), 0.9),
-        PartInstance(1, "jar_body", str(body_path), mask_to_bbox(body_mask), int(body_mask.sum()), 0.9),
-    ]
-    objects, summary = separate_scene_objects(
-        image_path=image_path,
-        object_mask_path=object_path,
-        parts=parts,
-        sam_tool=None,
-        output_dir=tmp_path / "objects",
-        object_name="jar",
-        mode="auto",
-        max_objects=4,
-    )
-    assert summary["object_count"] == 2
-    assert {part.metadata["object_id"] for part in parts} == {0, 1}
-    assert sorted(obj.part_ids for obj in objects) == [[0], [1]]
-    assert (tmp_path / "objects" / "objects_summary.json").exists()
 
 
 def test_material_normalization_and_clamping():

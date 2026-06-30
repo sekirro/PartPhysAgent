@@ -30,7 +30,6 @@ from .image_utils import (
     mask_area,
     mask_to_bbox,
     overlay_mask,
-    overlay_multiple_masks,
     read_mask,
     resize_to_square_with_padding,
     save_mask,
@@ -43,8 +42,6 @@ from .material_table import (
     density_for_material,
     normalize_material_name,
 )
-from .multi_object_physgm import run_multi_object_physgm
-from .object_separation import separate_scene_objects
 from .physgm_runner import PhysGMRunner, _find_physgm_root, _resolve_path
 from .part_seg_agent import PartSegAgentController
 from .proposals import generate_object_mask, generate_part_candidates
@@ -54,7 +51,7 @@ from .scene_builder import VIEW_LABELS, _candidate_multiview_paths
 from .selector import select_physical_parts
 from .sim_config_builder import build_part_aware_sim_config
 from .segmentation_agent import SegmentationAgent
-from .types import BBox, ObjectInstance, PartInstance, PartPhysResult, PartSpec, PhysGMResult, PhysicsParams
+from .types import BBox, PartInstance, PartPhysResult, PartSpec, PhysGMResult, PhysicsParams
 from .vlm import NoVLMClient, OpenAICompatibleVLMClient, normalize_part_schema, part_specs_from_schema
 
 
@@ -328,233 +325,6 @@ def run_simulation(
     (output_path / "stdout.txt").write_text(proc.stdout, encoding="utf-8")
     (output_path / "stderr.txt").write_text(proc.stderr, encoding="utf-8")
     return {"returncode": proc.returncode, "command": command_text, "stdout": str(output_path / "stdout.txt"), "stderr": str(output_path / "stderr.txt")}
-
-
-def _part_object_id(part: PartInstance) -> int:
-    try:
-        return int((part.metadata or {}).get("object_id", 0))
-    except Exception:
-        return 0
-
-
-def _write_ascii_object_ply(path: Path, positions: np.ndarray, indices: np.ndarray) -> None:
-    pts = np.asarray(positions)[indices]
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        f.write("ply\n")
-        f.write("format ascii 1.0\n")
-        f.write(f"element vertex {len(pts)}\n")
-        f.write("property float x\n")
-        f.write("property float y\n")
-        f.write("property float z\n")
-        f.write("end_header\n")
-        for x, y, z in pts:
-            f.write(f"{float(x):.8f} {float(y):.8f} {float(z):.8f}\n")
-
-
-def save_object_assignment_outputs(
-    output_dir,
-    gaussian_part_ids,
-    parts: list[PartInstance],
-    objects: list[ObjectInstance],
-    positions=None,
-    object_ids_override=None,
-) -> dict[str, Any]:
-    output_dir = Path(output_dir)
-    ids = np.asarray(gaussian_part_ids, dtype=np.int32)
-    part_to_object = {int(part.part_id): _part_object_id(part) for part in parts}
-    object_by_id = {int(obj.object_id): obj for obj in objects}
-    if object_ids_override is not None and len(object_ids_override) == len(ids):
-        object_ids = np.asarray(object_ids_override, dtype=np.int32)
-    else:
-        object_ids = np.full(len(ids), -1, dtype=np.int32)
-        for part_id, object_id in part_to_object.items():
-            object_ids[ids == int(part_id)] = int(object_id)
-    np.save(output_dir / "gaussian_object_ids.npy", object_ids)
-
-    per_object_dir = output_dir / "per_object_gaussians"
-    per_object_dir.mkdir(parents=True, exist_ok=True)
-    index = {"objects": [], "unassigned_count": int((object_ids < 0).sum())}
-    positions_arr = np.asarray(positions) if positions is not None else None
-    indexed_object_ids = set(int(x) for x in np.unique(object_ids[object_ids >= 0]))
-    indexed_object_ids.update(int(obj.object_id) for obj in objects)
-    for object_id in sorted(indexed_object_ids):
-        obj = object_by_id.get(object_id)
-        name = obj.name if obj is not None else f"object_{object_id}"
-        indices = np.where(object_ids == object_id)[0].astype(np.int64)
-        stem = f"object_{object_id:03d}_{_safe_name(name)}"
-        indices_path = output_dir / f"{stem}_indices.npy"
-        np.save(indices_path, indices)
-        ply_path = per_object_dir / f"{stem}.ply"
-        ply_value = None
-        if positions_arr is not None and len(indices) > 0:
-            _write_ascii_object_ply(ply_path, positions_arr, indices)
-            ply_value = str(ply_path)
-        if obj is not None:
-            obj.metadata["gaussian_count"] = int(len(indices))
-        index["objects"].append(
-            {
-                "object_id": object_id,
-                "object_name": name,
-                "count": int(len(indices)),
-                "part_ids": [int(pid) for pid, oid in part_to_object.items() if int(oid) == object_id],
-                "indices_path": str(indices_path),
-                "ply_path": ply_value,
-            }
-        )
-    with (output_dir / "object_gaussian_index.json").open("w", encoding="utf-8") as f:
-        json.dump(index, f, indent=2)
-    return {
-        "gaussian_object_ids": str(output_dir / "gaussian_object_ids.npy"),
-        "object_gaussian_index": str(output_dir / "object_gaussian_index.json"),
-        "per_object_gaussians_dir": str(per_object_dir),
-        "per_object_gaussian_counts": {str(item["object_id"]): int(item["count"]) for item in index["objects"]},
-    }
-
-
-def _part_view_mask_path(part: PartInstance, label: str) -> str | None:
-    if label == "front":
-        return part.mask_path
-    view_masks = (part.metadata or {}).get("view_masks") or {}
-    return view_masks.get(label)
-
-
-def _crop_mask_like_object_input(mask_path: str, crop_row: dict[str, Any], output_path: Path) -> str:
-    source = Image.open(mask_path).convert("L")
-    source_w = int(crop_row.get("source_width", source.width) or source.width)
-    source_h = int(crop_row.get("source_height", source.height) or source.height)
-    if source.size != (source_w, source_h):
-        source = source.resize((source_w, source_h), Image.Resampling.NEAREST)
-    output_size = int(crop_row.get("output_size", 512) or 512)
-    if "crop_x0" in crop_row and "crop_y0" in crop_row and "crop_size" in crop_row:
-        x0 = int(math.floor(float(crop_row["crop_x0"])))
-        y0 = int(math.floor(float(crop_row["crop_y0"])))
-        size = int(math.ceil(float(crop_row["crop_size"])))
-        canvas = np.zeros((size, size), dtype=np.uint8)
-        src = np.asarray(source)
-        sx0 = max(0, x0)
-        sy0 = max(0, y0)
-        sx1 = min(source.width, x0 + size)
-        sy1 = min(source.height, y0 + size)
-        if sx1 > sx0 and sy1 > sy0:
-            dx0 = sx0 - x0
-            dy0 = sy0 - y0
-            canvas[dy0 : dy0 + (sy1 - sy0), dx0 : dx0 + (sx1 - sx0)] = src[sy0:sy1, sx0:sx1]
-        out = Image.fromarray(canvas, mode="L").resize((output_size, output_size), Image.Resampling.NEAREST)
-    else:
-        out = source.resize((output_size, output_size), Image.Resampling.NEAREST)
-    arr = (np.asarray(out) > 0).astype(np.uint8) * 255
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(arr, mode="L").save(output_path)
-    return str(output_path)
-
-
-def assign_per_object_projection(
-    positions: np.ndarray,
-    parts: list[PartInstance],
-    direct_object_ids: np.ndarray | None,
-    whole_result: PhysGMResult,
-    output_dir: Path,
-) -> dict[str, Any] | None:
-    raw = whole_result.raw or {}
-    if raw.get("geometry_source") != "per_object_physgm":
-        return None
-    object_results = raw.get("object_results") or []
-    if direct_object_ids is None or len(direct_object_ids) != len(positions) or not object_results:
-        return None
-    output_dir = Path(output_dir)
-    ids = np.full(len(positions), -1, dtype=np.int32)
-    object_summaries: list[dict[str, Any]] = []
-    warnings: list[str] = []
-    for object_row in object_results:
-        try:
-            object_id = int(object_row["object_id"])
-        except Exception:
-            continue
-        object_indices = np.where(np.asarray(direct_object_ids, dtype=np.int32) == object_id)[0]
-        if len(object_indices) == 0:
-            continue
-        object_parts = [part for part in parts if _part_object_id(part) == object_id]
-        if not object_parts:
-            warnings.append(f"Object {object_id} has no local parts for projection assignment.")
-            continue
-        input_dir = Path(object_row.get("input_dir", ""))
-        physgm_dir = Path(object_row.get("physgm_dir", ""))
-        metadata_path = input_dir / "object_input_metadata.json"
-        camera_meta = physgm_dir / "input_batch_meta.npz"
-        if not metadata_path.exists() or not camera_meta.exists():
-            warnings.append(f"Object {object_id} missing crop metadata or camera metadata.")
-            continue
-        try:
-            input_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            warnings.append(f"Object {object_id} failed to read crop metadata: {exc}")
-            continue
-        view_rows = input_metadata.get("view_rows") or []
-        local_part_masks = []
-        local_mask_dir = output_dir / "object_local_part_masks" / f"object_{object_id:03d}_{_safe_name(object_row.get('object_name', 'object'))}"
-        for part in object_parts:
-            view_masks: dict[str, str] = {}
-            for label, crop_row in zip(VIEW_LABELS, view_rows):
-                source_mask = _part_view_mask_path(part, label)
-                if not source_mask:
-                    continue
-                try:
-                    view_masks[label] = _crop_mask_like_object_input(
-                        source_mask,
-                        crop_row,
-                        local_mask_dir / f"part_{int(part.part_id):03d}_{_safe_name(part.name)}_{label}.png",
-                    )
-                except Exception as exc:
-                    warnings.append(f"Object {object_id} part {part.name} {label} mask crop failed: {exc}")
-            mask_path = view_masks.get("front") or part.mask_path
-            local_part_masks.append(
-                {
-                    "part_id": part.part_id,
-                    "name": part.name,
-                    "mask_path": mask_path,
-                    "view_masks": view_masks,
-                    "area": part.area,
-                    "confidence": part.confidence,
-                    "physics_group": part.physics_group,
-                }
-            )
-        local_assign = assign_by_projection(positions[object_indices], local_part_masks, camera_meta, (512, 512))
-        local_ids = np.asarray(local_assign.get("gaussian_part_ids"), dtype=np.int32)
-        if len(local_ids) == len(object_indices):
-            ids[object_indices] = local_ids
-        object_summaries.append(
-            {
-                "object_id": object_id,
-                "object_name": object_row.get("object_name"),
-                "gaussian_count": int(len(object_indices)),
-                "assigned_ratio": float(local_assign.get("assigned_ratio", 0.0)),
-                "per_part_counts": local_assign.get("per_part_counts", {}),
-                "projection_views": local_assign.get("view_labels", []),
-                "projection_view_hits": local_assign.get("per_view_hits", {}),
-                "warnings": local_assign.get("warnings", []),
-            }
-        )
-        warnings.extend([f"object {object_id}: {item}" for item in local_assign.get("warnings", [])])
-    assigned = ids >= 0
-    counts = {str(pid): int((ids == int(pid)).sum()) for pid in np.unique(ids[assigned])}
-    return {
-        "gaussian_part_ids": ids,
-        "assigned_ratio": float(assigned.mean()) if len(ids) else 0.0,
-        "per_part_counts": counts,
-        "warnings": warnings,
-        "object_local_projection": object_summaries,
-        "view_labels": [],
-        "per_view_hits": {},
-        "projection_image_size": [512, 512],
-        "mean_view_support": 0.0,
-        "view_support_counts": {},
-        "margin_ratio": {},
-        "low_confidence_count": 0,
-        "smoothed_count": 0,
-        "knn_unknown_reassigned_count": 0,
-        "knn_island_reassigned_count": 0,
-    }
 
 
 class PartPhysAgent:
@@ -848,7 +618,6 @@ class PartPhysAgent:
                     sam,
                     view_object_dir,
                     fallback_to_full_image=bool(_get(self.config, "fallback_to_full_image", True)),
-                    keep_multi_components=str(_get(self.config, "object_mode", "single")).lower() == "auto",
                 )
                 for warning in object_warnings:
                     summary["warnings"].append(f"{label}: {warning}")
@@ -955,270 +724,6 @@ class PartPhysAgent:
         self._refresh_part_summaries(scene_dir, parts)
         return summary
 
-    def _attach_object_multiview_part_masks(
-        self,
-        parts: list[PartInstance],
-        schema: dict[str, Any],
-        obj: ObjectInstance,
-        image_path: str,
-        object_name: str,
-        detector,
-        sam,
-        vlm,
-        object_work_dir: Path,
-    ) -> dict[str, Any]:
-        multiview_dir = _get(self.config, "multiview_dir")
-        view_paths = _candidate_multiview_paths(multiview_dir)
-        if not view_paths:
-            for part in parts:
-                part.metadata.setdefault("view_masks", {})["front"] = part.mask_path
-            return {"enabled": False, "reason": "no_multiview_dir"}
-
-        for part in parts:
-            part.metadata.setdefault("view_masks", {})["front"] = part.mask_path
-            part.metadata.setdefault("view_part_summaries", {})
-
-        parts_by_name = {_part_key(part.name): part for part in parts}
-        summary: dict[str, Any] = {
-            "enabled": True,
-            "object_id": int(obj.object_id),
-            "object_name": object_name,
-            "multiview_dir": str(multiview_dir),
-            "view_labels": list(VIEW_LABELS),
-            "views": [],
-            "alignment": "object_local_part_schema_name",
-            "warnings": [],
-        }
-        canonical_path = Path(image_path).expanduser().resolve()
-        object_view_masks = (obj.metadata or {}).get("view_masks") or {}
-
-        for label, view_path in zip(VIEW_LABELS, view_paths):
-            view_path = Path(view_path).expanduser().resolve()
-            if label == "front" or view_path == canonical_path:
-                summary["views"].append({"label": label, "image_path": str(view_path), "source": "canonical", "matched_parts": [p.name for p in parts]})
-                continue
-            view_object_mask_path = object_view_masks.get(label)
-            if not view_object_mask_path:
-                warning = f"{label}: missing object view mask for object {obj.object_id}"
-                summary["warnings"].append(warning)
-                continue
-            try:
-                view_object_mask = read_mask(view_object_mask_path)
-                view_object_bbox = mask_to_bbox(view_object_mask)
-            except Exception as exc:
-                warning = f"{label}: failed to read object view mask for object {obj.object_id}: {exc}"
-                summary["warnings"].append(warning)
-                continue
-
-            view_output_dir = object_work_dir / "multiview_parts" / label
-            view_candidates_dir = object_work_dir / "multiview_candidates" / label
-            try:
-                view_parts, _, view_quality = self._run_segmentation_agent(
-                    image_path=str(view_path),
-                    object_mask_path=view_object_mask_path,
-                    object_bbox=view_object_bbox,
-                    schema=schema,
-                    detector=detector,
-                    sam=sam,
-                    vlm=vlm,
-                    output_dir=view_output_dir,
-                    candidates_dir=view_candidates_dir,
-                    overrides={},
-                )
-            except Exception as exc:
-                warning = f"{label}: object-local multiview part segmentation failed for object {obj.object_id}: {exc}"
-                summary["warnings"].append(warning)
-                self.warnings.append(warning)
-                continue
-
-            view_by_name = {_part_key(part.name): part for part in view_parts}
-            matched = []
-            missing = []
-            for key, part in parts_by_name.items():
-                view_part = view_by_name.get(key)
-                if view_part is None:
-                    if not _is_residual_part(part):
-                        missing.append(part.name)
-                    continue
-                part.metadata["view_masks"][label] = view_part.mask_path
-                part.metadata["view_part_summaries"][label] = {
-                    "source": "object_local_multiview_segmentation",
-                    "area": view_part.area,
-                    "bbox": view_part.bbox.to_dict(),
-                    "confidence": view_part.confidence,
-                    "candidate_ids": list(view_part.candidate_ids),
-                }
-                matched.append(part.name)
-            if missing:
-                warning = f"{label}: missing object-local aligned parts for object {obj.object_id}: {', '.join(missing)}"
-                summary["warnings"].append(warning)
-                self.warnings.append(warning)
-            if not (view_quality or {}).get("ok", True):
-                warning = f"{label}: object-local multiview segmentation accepted with warnings: {(view_quality or {}).get('reason')}"
-                summary["warnings"].append(warning)
-                self.warnings.append(warning)
-            summary["views"].append(
-                {
-                    "label": label,
-                    "image_path": str(view_path),
-                    "source": "object_local_multiview_segmentation",
-                    "quality": view_quality,
-                    "matched_parts": matched,
-                    "missing_parts": missing,
-                    "view_parts_dir": str(view_output_dir / "parts"),
-                }
-            )
-
-        _write_json(object_work_dir / "multiview_part_summary.json", summary)
-        return summary
-
-    def _run_object_centric_part_segmentation(
-        self,
-        objects: list[ObjectInstance],
-        image_path: str,
-        object_name: str,
-        detector,
-        sam,
-        vlm,
-        scene_dir: Path,
-    ) -> tuple[list[PartInstance], list[ObjectInstance], dict[str, Any]]:
-        object_parts_root = scene_dir / "object_parts"
-        object_parts_root.mkdir(parents=True, exist_ok=True)
-        all_parts: list[PartInstance] = []
-        summary: dict[str, Any] = {"enabled": True, "objects": [], "warnings": []}
-        next_part_id = 0
-        view_paths = _candidate_multiview_paths(_get(self.config, "multiview_dir"))
-
-        for obj in objects:
-            object_work_dir = object_parts_root / f"object_{int(obj.object_id):03d}_{_safe_name(obj.name)}"
-            object_work_dir.mkdir(parents=True, exist_ok=True)
-            object_input = self._save_object_inputs(image_path, obj.mask_path, obj.bbox, object_work_dir / "input")
-            object_label = obj.name
-            try:
-                identified = vlm.identify_object(object_input).get("object")
-                if identified and str(identified).strip().lower() not in {"object", "foreground"}:
-                    object_label = str(identified).strip()
-            except Exception as exc:
-                summary["warnings"].append(f"Object {obj.object_id}: VLM object identification failed: {exc}")
-
-            schema = self._schema_from_manual_or_file(None, object_label)
-            if not schema:
-                schema = vlm.generate_part_schema(object_input, object_label, obj.mask_path)
-            schema = normalize_part_schema(schema, object_label)
-            _write_json(object_work_dir / "schema" / "part_schema.json", schema)
-
-            object_agent = PartSegAgentController(self.config, object_work_dir, vlm, object_label, object_input, view_paths)
-            agent_plan = object_agent.plan(schema)
-            if (
-                object_agent.enabled
-                and not _get(self.config, "part_schema_json")
-                and isinstance(agent_plan.get("parts"), list)
-                and agent_plan.get("parts")
-            ):
-                schema = normalize_part_schema(
-                    {
-                        "object": agent_plan.get("object") or object_label,
-                        "parts": agent_plan.get("parts", []),
-                        "relations": agent_plan.get("relations", []),
-                    },
-                    object_label,
-                )
-                _write_json(object_work_dir / "schema" / "part_schema.json", schema)
-                _write_json(object_work_dir / "schema" / "agent_plan.json", agent_plan)
-
-            object_parts: list[PartInstance] = []
-            quality: dict[str, Any] = {}
-            critique = None
-            rounds = object_agent.max_rounds if object_agent.enabled else 1
-            for round_idx in range(rounds):
-                overrides = object_agent.round_overrides(critique, round_idx, {"stage": "object_part", "object_id": int(obj.object_id)})
-                round_output_dir = object_work_dir if round_idx == 0 else object_work_dir / "agent_rounds" / f"round_{round_idx:02d}"
-                round_candidates_dir = round_output_dir / "candidates"
-                object_parts, _, quality = self._run_segmentation_agent(
-                    image_path=image_path,
-                    object_mask_path=obj.mask_path,
-                    object_bbox=obj.bbox,
-                    schema=schema,
-                    detector=detector,
-                    sam=sam,
-                    vlm=vlm,
-                    output_dir=round_output_dir,
-                    candidates_dir=round_candidates_dir,
-                    overrides=overrides,
-                )
-                overlay_path = round_output_dir / "parts" / "parts_overlay.png"
-                critique = object_agent.critique(object_parts, quality, overlay_path, round_idx)
-                object_agent.record_round(round_idx, object_parts, quality, critique, overrides)
-                if not object_agent.should_retry(critique, quality, round_idx):
-                    break
-            if not object_parts:
-                warning = f"Object {obj.object_id}: object-local part segmentation produced no parts."
-                summary["warnings"].append(warning)
-                self.warnings.append(warning)
-                continue
-
-            multiview_summary = self._attach_object_multiview_part_masks(
-                object_parts,
-                schema,
-                obj,
-                image_path,
-                object_label,
-                detector,
-                sam,
-                vlm,
-                object_work_dir,
-            )
-            object_agent.record_multiview_summary(multiview_summary, object_parts)
-
-            remapped_part_ids = []
-            for part in object_parts:
-                local_part_id = int(part.part_id)
-                part.part_id = next_part_id
-                next_part_id += 1
-                part.metadata["object_id"] = int(obj.object_id)
-                part.metadata["object_name"] = object_label
-                part.metadata["object_mask_path"] = obj.mask_path
-                part.metadata["object_local_part_id"] = local_part_id
-                part.metadata["object_part_schema"] = schema
-                part.physics_group = f"object_{int(obj.object_id)}:{part.physics_group or part.name}"
-                remapped_part_ids.append(int(part.part_id))
-                all_parts.append(part)
-                _write_json(Path(part.mask_path).parent / "part_summary.json", {"part": part.to_dict()})
-
-            obj.name = _safe_name(object_label)
-            obj.part_ids = remapped_part_ids
-            obj.metadata["object_centric_part_schema"] = schema
-            obj.metadata["object_centric_parts_dir"] = str(object_work_dir / "parts")
-            summary["objects"].append(
-                {
-                    "object_id": int(obj.object_id),
-                    "object_name": obj.name,
-                    "part_ids": remapped_part_ids,
-                    "part_count": len(remapped_part_ids),
-                    "quality": quality,
-                    "parts_dir": str(object_work_dir / "parts"),
-                    "multiview_summary": multiview_summary,
-                }
-            )
-
-        if all_parts:
-            masks = []
-            labels = []
-            image = load_rgb(image_path)
-            for part in all_parts:
-                try:
-                    masks.append(read_mask(part.mask_path))
-                    labels.append(f"{part.part_id}:{part.metadata.get('object_name', '')}/{part.name}")
-                except Exception:
-                    continue
-            parts_dir = scene_dir / "parts"
-            parts_dir.mkdir(parents=True, exist_ok=True)
-            if masks:
-                save_rgb(overlay_multiple_masks(image, masks, labels=labels), parts_dir / "parts_overlay.png")
-            _write_json(parts_dir / "selection_summary.json", {"source": "object_centric", "parts": [p.to_dict() for p in all_parts], "warnings": summary["warnings"]})
-        _write_json(object_parts_root / "object_centric_part_summary.json", summary)
-        return all_parts, objects, summary
-
 
     def _load_whole_physgm_result(self, whole_dir) -> PhysGMResult:
         whole_dir = Path(whole_dir).expanduser().resolve()
@@ -1303,7 +808,6 @@ class PartPhysAgent:
                 sam,
                 object_dir,
                 fallback_to_full_image=bool(_get(self.config, "fallback_to_full_image", True)),
-                keep_multi_components=str(_get(self.config, "object_mode", "single")).lower() == "auto",
             )
             object_mask_path = Path(object_mask_path)
             self.warnings.extend(object_warnings)
@@ -1371,42 +875,6 @@ class PartPhysAgent:
         if multiview_critique and not multiview_critique.get("ok", True):
             self.warnings.append("Agent multiview critic accepted result with warnings.")
 
-        objects, object_summary = separate_scene_objects(
-            image_path=image_path,
-            object_mask_path=object_mask_path,
-            parts=parts,
-            sam_tool=sam,
-            output_dir=scene_dir / "objects",
-            object_name=object_name,
-            mode=_get(self.config, "object_mode", "single"),
-            max_objects=int(_get(self.config, "max_objects", 6)),
-            min_object_area_ratio=float(_get(self.config, "min_object_area_ratio", 0.015)),
-            multiview_dir=_get(self.config, "multiview_dir"),
-        )
-        self.warnings.extend(object_summary.get("warnings", []))
-        if (
-            str(_get(self.config, "object_mode", "single")).lower() == "auto"
-            and len(objects) > 1
-            and not manual_parts
-        ):
-            object_centric_parts, objects, object_centric_summary = self._run_object_centric_part_segmentation(
-                objects=objects,
-                image_path=image_path,
-                object_name=object_name,
-                detector=detector,
-                sam=sam,
-                vlm=vlm,
-                scene_dir=scene_dir,
-            )
-            if object_centric_parts:
-                parts = object_centric_parts
-                object_summary["object_centric_parts"] = object_centric_summary
-                object_summary["objects"] = [obj.to_dict() for obj in objects]
-                _write_json(scene_dir / "objects" / "objects_summary.json", object_summary)
-            else:
-                self.warnings.append("Object-centric part segmentation produced no usable parts; kept global part segmentation.")
-        self._refresh_part_summaries(scene_dir, parts)
-
         if bool(_get(self.config, "mask_only", False)):
             self.warnings.append("Mask-only mode; stopped after object mask and part masks.")
             result = PartPhysResult(
@@ -1414,7 +882,6 @@ class PartPhysAgent:
                 object_name=object_name,
                 object_mask_path=str(object_mask_path),
                 parts=parts,
-                objects=objects,
                 part_physics={},
                 whole_physgm=PhysGMResult("", None, "", "", 0.0, 0.0, None, {}),
                 assignment_summary={"mode": "mask_only", "warnings": ["Mask-only mode skipped PhysGM, assignment, and simulation config."]},
@@ -1466,8 +933,7 @@ class PartPhysAgent:
             physgm_runner = get_runner()
             for part in parts:
                 part_dir = Path(part.mask_path).parent
-                part_object_mask_path = (part.metadata or {}).get("object_mask_path") or object_mask_path
-                crops = build_part_crops(image_path, part_object_mask_path, part.mask_path, part_dir)
+                crops = build_part_crops(image_path, object_mask_path, part.mask_path, part_dir)
                 try:
                     material_prior = vlm.infer_material_prior(crops.get("padded") or image_path, part.name)
                 except Exception as exc:
@@ -1478,64 +944,19 @@ class PartPhysAgent:
                 self.warnings.extend(params.warnings)
 
         whole_dir_arg = _get(self.config, "whole_physgm_dir")
-        direct_object_ids = None
-        physgm_scene_mode = "single_object"
         if whole_dir_arg:
             whole_result = self._load_whole_physgm_result(whole_dir_arg)
             whole_dir = Path(whole_result.scene_dir)
         else:
             whole_dir = scene_dir / "physgm_whole"
-            should_run_multi_object = (
-                str(_get(self.config, "object_mode", "auto")).lower() == "auto"
-                and len(objects) > 1
+            whole_result = get_runner().infer_image(
+                whole_input_image,
+                scene_name=f"{scene_name}_whole",
+                output_dir=whole_dir,
+                save_gaussian=True,
+                use_mvadapter=bool(_get(self.config, "use_mvadapter", False)),
+                multiview_dir=_get(self.config, "multiview_dir"),
             )
-            if should_run_multi_object:
-                physgm_scene_mode = "multi_object"
-                geometry_source = str(_get(self.config, "multi_object_geometry_source", "whole_scene")).lower()
-                multi_object_result = None
-                if geometry_source == "per_object":
-                    try:
-                        multi_object_result, direct_object_ids = run_multi_object_physgm(
-                            get_runner(),
-                            whole_input_image,
-                            scene_name=f"{scene_name}_multi_object",
-                            output_dir=whole_dir / "per_object_physgm",
-                            objects=objects,
-                            multiview_dir=_get(self.config, "multiview_dir"),
-                            use_mvadapter=bool(_get(self.config, "use_mvadapter", False)),
-                        )
-                    except Exception as exc:
-                        self.warnings.append(f"Per-object PhysGM failed; continuing with whole-scene geometry and projection labels: {exc}")
-                else:
-                    self.warnings.append("Using whole-scene PhysGM geometry for multi-object scene; object and part labels are assigned by multi-view projection.")
-                if multi_object_result is not None:
-                    whole_result = multi_object_result
-                    whole_dir = Path(whole_result.scene_dir)
-                    whole_result.raw["mode"] = "multi_object_per_object_merged"
-                    whole_result.raw["geometry_source"] = "per_object_physgm"
-                else:
-                    whole_result = get_runner().infer_image(
-                        whole_input_image,
-                        scene_name=f"{scene_name}_whole",
-                        output_dir=whole_dir,
-                        save_gaussian=True,
-                        use_mvadapter=bool(_get(self.config, "use_mvadapter", False)),
-                        multiview_dir=_get(self.config, "multiview_dir"),
-                    )
-                    whole_result.raw["mode"] = "multi_object_whole_scene"
-                    whole_result.raw["geometry_source"] = "whole_scene_physgm"
-                    whole_result.raw["per_object_physgm_dir"] = None
-                    whole_result.raw["per_object_physgm"] = None
-                _write_json(whole_result.predicted_phys_path, whole_result.raw)
-            else:
-                whole_result = get_runner().infer_image(
-                    whole_input_image,
-                    scene_name=f"{scene_name}_whole",
-                    output_dir=whole_dir,
-                    save_gaussian=True,
-                    use_mvadapter=bool(_get(self.config, "use_mvadapter", False)),
-                    multiview_dir=_get(self.config, "multiview_dir"),
-                )
         if not whole_result.point_cloud_path:
             self.warnings.append("Whole-object PhysGM did not produce point_clouds.ply.")
 
@@ -1545,23 +966,19 @@ class PartPhysAgent:
         if assignment_mode != "none" and whole_result.point_cloud_path and Path(whole_result.point_cloud_path).exists():
             positions = load_ply_positions(whole_result.point_cloud_path)
             if assignment_mode == "projection":
-                assign = assign_per_object_projection(positions, parts, direct_object_ids, whole_result, scene_dir / "assignment")
-                if assign is not None:
-                    assignment_summary["mode"] = "object_local_projection"
-                else:
-                    part_masks = [
-                        {
-                            "part_id": p.part_id,
-                            "name": p.name,
-                            "mask_path": p.mask_path,
-                            "view_masks": p.metadata.get("view_masks", {}),
-                            "area": p.area,
-                            "confidence": p.confidence,
-                            "physics_group": p.physics_group,
-                        }
-                        for p in parts
-                    ]
-                    assign = assign_by_projection(positions, part_masks, whole_dir / "input_batch_meta.npz", image.size)
+                part_masks = [
+                    {
+                        "part_id": p.part_id,
+                        "name": p.name,
+                        "mask_path": p.mask_path,
+                        "view_masks": p.metadata.get("view_masks", {}),
+                        "area": p.area,
+                        "confidence": p.confidence,
+                        "physics_group": p.physics_group,
+                    }
+                    for p in parts
+                ]
+                assign = assign_by_projection(positions, part_masks, whole_dir / "input_batch_meta.npz", image.size)
                 if assign.get("assigned_ratio", 0.0) < 0.05 and bool(_get(self.config, "fallback_to_aabb_heuristic", True)):
                     self.warnings.append("Projection assignment ratio too low; falling back to AABB heuristic.")
                     fallback = assign_by_aabb_heuristic(positions, parts, image.size)
@@ -1594,70 +1011,17 @@ class PartPhysAgent:
                     "projection_smoothed_count": assign.get("smoothed_count", 0),
                     "projection_knn_unknown_reassigned_count": assign.get("knn_unknown_reassigned_count", 0),
                     "projection_knn_island_reassigned_count": assign.get("knn_island_reassigned_count", 0),
-                    "object_local_projection": assign.get("object_local_projection", []),
                     "aabb_count": len(part_aabbs),
-                    "physgm_scene_mode": physgm_scene_mode,
                     "warnings": assign.get("warnings", []),
                 }
             )
             save_assignment_outputs(scene_dir / "assignment", ids, part_aabbs, assignment_summary, parts, whole_result.point_cloud_path)
-            projected_object_ids = None
-            object_projection_summary = None
-            if direct_object_ids is not None and len(direct_object_ids) == len(ids):
-                projected_object_ids = direct_object_ids
-                assignment_summary["object_assignment_source"] = "multi_object_physgm_direct"
-            elif assignment_mode == "projection" and objects:
-                object_masks = [
-                    {
-                        "part_id": obj.object_id,
-                        "name": obj.name,
-                        "mask_path": obj.mask_path,
-                        "view_masks": obj.metadata.get("view_masks", {}),
-                        "area": obj.area,
-                        "confidence": obj.confidence,
-                    }
-                    for obj in objects
-                ]
-                object_assign = assign_by_projection(positions, object_masks, whole_dir / "input_batch_meta.npz", image.size)
-                projected_object_ids = object_assign.get("gaussian_part_ids")
-                object_projection_summary = {
-                    "assigned_ratio": object_assign.get("assigned_ratio", 0.0),
-                    "per_object_counts": object_assign.get("per_part_counts", {}),
-                    "projection_views": object_assign.get("view_labels", []),
-                    "projection_view_hits": object_assign.get("per_view_hits", {}),
-                    "warnings": object_assign.get("warnings", []),
-                }
-                assignment_summary["object_assignment_source"] = "object_mask_projection"
-            object_assignment = save_object_assignment_outputs(
-                scene_dir / "assignment",
-                ids,
-                parts,
-                objects,
-                positions,
-                object_ids_override=projected_object_ids,
-            )
-            if object_projection_summary is not None:
-                assignment_summary["object_projection_assignment"] = object_projection_summary
-            assignment_summary.update(object_assignment)
-            _write_json(scene_dir / "assignment" / "assignment_summary.json", assignment_summary)
-            _write_json(
-                scene_dir / "objects" / "objects_summary.json",
-                {
-                    "mode": _get(self.config, "object_mode", "single"),
-                    "object_count": len(objects),
-                    "objects": [obj.to_dict() for obj in objects],
-                    "warnings": object_summary.get("warnings", []),
-                },
-            )
             self.warnings.extend(assign.get("warnings", []))
             if not part_aabbs:
                 self.warnings.append("No valid part AABBs built; simulation will use only global physics.")
         else:
             assignment_summary["warnings"].append("Assignment skipped.")
             save_assignment_outputs(scene_dir / "assignment", np.array([], dtype=np.int32), [], assignment_summary, parts, whole_result.point_cloud_path)
-            object_assignment = save_object_assignment_outputs(scene_dir / "assignment", np.array([], dtype=np.int32), parts, objects, None)
-            assignment_summary.update(object_assignment)
-            _write_json(scene_dir / "assignment" / "assignment_summary.json", assignment_summary)
 
         if segmentation_only:
             result = PartPhysResult(
@@ -1665,7 +1029,6 @@ class PartPhysAgent:
                 object_name=object_name,
                 object_mask_path=str(object_mask_path),
                 parts=parts,
-                objects=objects,
                 part_physics=part_physics,
                 whole_physgm=whole_result,
                 assignment_summary=assignment_summary,
@@ -1681,19 +1044,13 @@ class PartPhysAgent:
         if not template_config or not Path(template_config).exists():
             raise RuntimeError(f"Template config not found: {_get(self.config, 'template_config')}")
         sim_config_path = simulation_dir / "sim_config_partphys.json"
-        sim_part_physics = part_physics
-        sim_part_aabbs = part_aabbs
-        if physgm_scene_mode == "multi_object" and bool(_get(self.config, "skip_part_physgm", False)):
-            sim_part_physics = {}
-            sim_part_aabbs = []
-            self.warnings.append("Multi-object simulation used global physics only because per-part PhysGM was skipped.")
         _, sim_warnings = build_part_aware_sim_config(
             template_config,
             sim_config_path,
             whole_result,
             parts,
-            sim_part_physics,
-            sim_part_aabbs,
+            part_physics,
+            part_aabbs,
         )
         self.warnings.extend(sim_warnings)
 
@@ -1736,7 +1093,6 @@ class PartPhysAgent:
             object_name=object_name,
             object_mask_path=str(object_mask_path),
             parts=parts,
-            objects=objects,
             part_physics=part_physics,
             whole_physgm=whole_result,
             assignment_summary=assignment_summary,

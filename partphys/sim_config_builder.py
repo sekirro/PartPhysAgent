@@ -21,18 +21,6 @@ def _solver_safe_global_values(material: str, E: float, nu: float, density: floa
 def _solver_safe_local_values(part_name: str, E: float, nu: float, density: float, warnings: list[str]):
     return float(E), float(nu), float(density)
 
-
-def _stabilize_time_step(config: dict[str, Any], E: float, warnings: list[str]) -> None:
-    if not math.isfinite(E) or E <= 0:
-        return
-    current_dt = float(config.get("substep_dt", 2e-4))
-    reference_E = 2.5e6
-    target_dt = current_dt * math.sqrt(reference_E / max(float(E), reference_E))
-    if target_dt < current_dt:
-        config["substep_dt"] = float(target_dt)
-        warnings.append(f"Simulation substep_dt adjusted from {current_dt:g} to {target_dt:g} for E={E:g}.")
-
-
 def _phys_values(phys: PhysicsParams | PhysGMResult | None):
     if phys is None:
         material = "Plastic"
@@ -44,23 +32,6 @@ def _phys_values(phys: PhysicsParams | PhysGMResult | None):
     if density is None:
         density = density_for_material(material)
     return material, E, nu, float(density)
-
-
-def _sanitize_global_physics(material: str, E: float, nu: float, density: float, warnings: list[str]):
-    if not math.isfinite(E) or E <= 0:
-        warnings.append(f"Invalid global E replaced with {default_E_for_material(material):g} for {material}.")
-        E = default_E_for_material(material)
-    if not math.isfinite(nu) or not (0 <= nu < 0.5):
-        replacement = min(default_nu_for_material(material), 0.49)
-        warnings.append(f"Invalid global nu {nu:g} replaced with {replacement:g} for {material}.")
-        nu = replacement
-    if not math.isfinite(density) or density <= 0:
-        warnings.append(f"Invalid global density replaced with {density_for_material(material):g} for {material}.")
-        density = density_for_material(material)
-    return material, float(E), float(nu), float(density)
-
-
-
 
 
 def _valid_param(E: float, nu: float, density: float, point, size) -> bool:
@@ -90,7 +61,6 @@ def build_part_aware_sim_config(
     with open(template_config_path, "r", encoding="utf-8") as f:
         config = json.load(f)
     material, E, nu, density = _phys_values(whole_physics)
-    material, E, nu, density = _sanitize_global_physics(material, E, nu, density, warnings)
     if E <= 0 or not (0 <= nu < 0.5) or density <= 0:
         largest = max(part_instances, key=lambda p: p.area, default=None)
         if largest is not None and largest.part_id in part_physics:
@@ -105,7 +75,12 @@ def build_part_aware_sim_config(
     config["E"] = float(sim_E)
     config["nu"] = float(sim_nu)
     config["density"] = float(sim_density)
-    _stabilize_time_step(config, sim_E, warnings)
+    if float(config.get("init_radius", 1.8)) > 1.0:
+        config["init_radius"] = 0.85
+        warnings.append("Simulation camera init_radius adjusted to 0.85 for visible part rendering.")
+    if config.get("mpm_space_viewpoint_center") == [1, 0.8, 1]:
+        config["mpm_space_viewpoint_center"] = [1, 1.0, 1]
+        warnings.append("Simulation camera viewpoint center adjusted for visible hammer rendering.")
 
     part_by_id = {p.part_id: p for p in part_instances}
     additional = []

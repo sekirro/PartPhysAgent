@@ -120,7 +120,7 @@ class PhysGMRunner:
         mock: bool = False,
         save_gaussian_default: bool = True,
         physgm_root: str | None = None,
-        amp_dtype: str = "fp16",
+        amp_dtype: str = "bf16",
         mvadapter_root: str | None = None,
         mvadapter_variant: str = "sd",
         mvadapter_device: str | None = None,
@@ -310,14 +310,8 @@ class PhysGMRunner:
         config.data.data_path = scene_info["data_txt"]
         dataset = self.Dataset(config)
         dataloader = self.DataLoader(dataset, batch_size=1, shuffle=False)
-        if self.amp_dtype == "fp16":
-            amp = torch.float16
-            autocast_cm = torch.autocast(device_type="cuda", dtype=amp) if "cuda" in str(self.device) else nullcontext()
-        elif self.amp_dtype == "bf16":
-            amp = torch.bfloat16
-            autocast_cm = torch.autocast(device_type="cuda", dtype=amp) if "cuda" in str(self.device) else nullcontext()
-        else:
-            autocast_cm = nullcontext()
+        amp = torch.float16 if self.amp_dtype == "fp16" else torch.bfloat16
+        autocast_cm = torch.autocast(device_type="cuda", dtype=amp) if "cuda" in str(self.device) else nullcontext()
         with torch.no_grad():
             batch = next(iter(dataloader))
             for key, value in batch.items():

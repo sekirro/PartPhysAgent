@@ -18,20 +18,17 @@ def _resolve_device(device: str) -> str:
 
 
 def _default_amp_dtype(device: str) -> str:
-    return "fp16" if "cuda" in device else "fp32"
+    return "bf16" if "cuda" in device else "fp32"
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="PartPhysAgent inference-only extension for PhysGM.")
-    parser.add_argument("--image", type=str, default=None, help="Single RGB input image. Required unless --multi-object-source-manifest is set.")
+    parser.add_argument("--image", type=str, required=True, help="Single RGB input image.")
     parser.add_argument("--scene-name", type=str, required=True, help="Scene name used under output-dir.")
     parser.add_argument("--output-dir", type=str, default="results_partphys", help="Output root directory.")
     parser.add_argument("--physgm-config", type=str, default="../PhysGM/configs/infer.yaml", help="PhysGM infer.yaml path.")
     parser.add_argument("--checkpoint", type=str, default="../PhysGM/checkpoints/checkpoint.pt", help="PhysGM checkpoint path.")
     parser.add_argument("--template-config", type=str, default="../PhysGM/configs/physical/down_template.json", help="PhysGM physical template JSON.")
-    parser.add_argument("--multi-object-source-manifest", type=str, default=None, help="JSON manifest listing one four-view directory per object for direct multi-object PhysGM reconstruction.")
-    parser.add_argument("--multi-object-flow", choices=["physgm_only", "partphys", "partphys_material"], default="partphys_material", help="Source-manifest multi-object flow: debug PhysGM-only, per-object PartPhysAgent, or per-object PartPhysAgent plus MaterialAgent.")
-    parser.add_argument("--material-agent-root", type=str, default="/root/MaterialAgent", help="Path to MaterialAgent repository used by --multi-object-flow partphys_material.")
     parser.add_argument("--physgm-root", type=str, default=None, help="Path to the original PhysGM repository.")
     parser.add_argument("--object", type=str, default=None, help="Optional object name hint.")
     parser.add_argument("--device", type=str, default="auto")
@@ -89,16 +86,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--segmentation-only", action="store_true", help="Stop after part masks and Gaussian-part assignment outputs.")
     parser.add_argument("--mask-only", action="store_true", help="Stop after object mask, part masks, and segmentation reports.")
     parser.add_argument("--whole-physgm-dir", type=str, default=None, help="Existing whole-object PhysGM output dir containing point_clouds.ply.")
-    parser.add_argument("--object-mode", choices=["single", "auto"], default="auto", help="Automatically separate foreground into object instances; use single to force legacy one-object behavior.")
-    parser.add_argument(
-        "--multi-object-geometry-source",
-        choices=["whole_scene", "per_object"],
-        default="whole_scene",
-        help="For multi-object scenes, use raw whole-scene PhysGM geometry by default; per_object keeps the experimental masked per-object merge.",
-    )
-    parser.add_argument("--max-objects", type=int, default=6, help="Maximum object instances exported when --object-mode auto is enabled.")
-    parser.add_argument("--max-vertices-per-object", type=int, default=0, help="Maximum Gaussian vertices kept per object when merging source-view multi-object reconstructions; <=0 keeps all.")
-    parser.add_argument("--min-object-area-ratio", type=float, default=0.015, help="Minimum object proposal area relative to the foreground object mask.")
     parser.add_argument("--segmentation-mode", choices=["candidate_pool", "legacy_vlm_bbox"], default="candidate_pool")
     parser.add_argument("--use-vlm-bbox-proposals", action="store_true", default=False)
     parser.add_argument("--use-schema-location-proposals", action="store_true", default=False)
@@ -123,38 +110,6 @@ def main(argv=None) -> int:
     args.device = _resolve_device(args.device)
     if args.amp_dtype == "auto":
         args.amp_dtype = _default_amp_dtype(args.device)
-    if args.multi_object_source_manifest:
-        from partphys.source_multiview_scene import run_source_multiview_scene
-
-        physgm_root = args.physgm_root
-        if physgm_root is None:
-            physgm_root = str(Path(args.physgm_config).expanduser().resolve().parents[1])
-        max_vertices = None if args.max_vertices_per_object <= 0 else int(args.max_vertices_per_object)
-        summary = run_source_multiview_scene(
-            manifest_path=args.multi_object_source_manifest,
-            output_dir=args.output_dir,
-            scene_name=args.scene_name,
-            physgm_config=args.physgm_config,
-            checkpoint=args.checkpoint,
-            template_config=args.template_config,
-            physgm_root=physgm_root,
-            device=args.device,
-            amp_dtype=args.amp_dtype,
-            simulate=args.simulate,
-            white_bg=args.white_bg,
-            max_vertices_per_object=max_vertices,
-            partphys_root=Path(__file__).resolve().parent,
-            material_agent_root=args.material_agent_root,
-            object_flow=args.multi_object_flow,
-        )
-        scene_dir = Path(args.output_dir) / args.scene_name
-        print(f"Source-view multi-object finished: {scene_dir}")
-        print(f"Summary: {scene_dir / 'raw_output_summary.json'}")
-        if summary.get("simulation_result"):
-            print(f"Simulation: {scene_dir / 'simulation'}")
-        return 0
-    if not args.image:
-        parser.error("--image is required unless --multi-object-source-manifest is set")
     agent = PartPhysAgent(args)
     result = agent.run(args.image, args.scene_name, object_hint=args.object)
     print(f"PartPhysAgent finished: {Path(result.sim_config_path).parent.parent if result.sim_config_path else args.output_dir}")
