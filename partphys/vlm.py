@@ -208,6 +208,17 @@ def _template_schema(object_name: str) -> dict[str, Any]:
                 "visible": True,
                 "physics_group": "icing",
             },
+            {
+                "name": "support_plate",
+                "text_prompts": ["serving plate", "dish", "tray", "bottom support plate"],
+                "expected_materials": ["Ceramic", "Glass", "Plastic"],
+                "location": "wide thin support under the dessert if visible",
+                "shape_prior": "wide thin plate or tray",
+                "physical_role": "rigid support part",
+                "should_simulate_separately": True,
+                "visible": True,
+                "physics_group": "support",
+            },
         ]
     else:
         parts = [

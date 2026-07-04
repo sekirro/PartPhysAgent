@@ -15,6 +15,7 @@ from partphys.image_utils import bbox_expand, mask_iou, mask_to_bbox, read_mask,
 from partphys.material_table import clamp_physics_to_material, normalize_material_name
 from partphys.multiview import split_mvadapter_grid
 from partphys.physgm_runner import PhysGMRunner
+from partphys.proposals import generate_part_candidates
 from partphys.scene_builder import build_physgm_input_scene
 from partphys.segmentation_agent import SegmentationAgent
 from partphys.sim_config_builder import build_part_aware_sim_config
@@ -74,6 +75,111 @@ def test_material_normalization_and_clamping():
     assert E <= 1e8
     assert nu >= 0.40
     assert warnings
+
+
+def test_no_vlm_cake_schema_includes_physical_support_part():
+    schema = NoVLMClient().generate_part_schema("/tmp/cake.png", "cake")
+    parts = {part["name"]: part for part in schema["parts"]}
+
+    assert "support_plate" in parts
+    assert "Ceramic" in parts["support_plate"]["expected_materials"]
+    assert parts["support_plate"]["physics_group"] == "support"
+
+
+def test_material_color_priors_generate_metal_head_and_wood_handle(tmp_path):
+    image = np.zeros((80, 80, 3), dtype=np.uint8)
+    image[8:24, 16:64] = [130, 132, 132]
+    image[24:72, 34:46] = [118, 72, 38]
+    image_path = tmp_path / "hammer.png"
+    Image.fromarray(image).save(image_path)
+
+    head = np.zeros((80, 80), dtype=bool)
+    head[8:24, 16:64] = True
+    handle = np.zeros((80, 80), dtype=bool)
+    handle[24:72, 34:46] = True
+    object_mask = head | handle
+    object_mask_path = tmp_path / "object_mask.png"
+    save_mask(object_mask, object_mask_path)
+
+    candidates = generate_part_candidates(
+        image_path,
+        object_mask_path,
+        mask_to_bbox(object_mask),
+        {
+            "object": "hammer",
+            "parts": [
+                {
+                    "name": "head",
+                    "text_prompts": ["hammer head"],
+                    "expected_materials": ["Metal"],
+                    "location": "top compact region",
+                    "shape_prior": "compact block",
+                    "visible": True,
+                },
+                {
+                    "name": "handle",
+                    "text_prompts": ["wooden handle"],
+                    "expected_materials": ["Wood"],
+                    "location": "long lower part",
+                    "shape_prior": "long thin bar",
+                    "visible": True,
+                },
+            ],
+        },
+        detector=None,
+        sam_tool=None,
+        output_dir=tmp_path / "candidates",
+        min_part_area_ratio=0.01,
+    )
+
+    by_prior = {(c.prompt, c.metadata.get("color_prior")): c for c in candidates if c.source == "color_prior"}
+    assert ("head", "metal_gray") in by_prior
+    assert ("handle", "wood_brown") in by_prior
+    assert mask_iou(read_mask(by_prior[("head", "metal_gray")].mask_path), head) > 0.85
+    assert mask_iou(read_mask(by_prior[("handle", "wood_brown")].mask_path), handle) > 0.85
+
+
+def test_material_color_prior_keeps_long_handle_extent(tmp_path):
+    image = np.zeros((80, 80, 3), dtype=np.uint8)
+    image[8:24, 16:64] = [130, 132, 132]
+    image[24:72, 34:46] = [118, 72, 38]
+    image_path = tmp_path / "hammer.png"
+    Image.fromarray(image).save(image_path)
+
+    head = np.zeros((80, 80), dtype=bool)
+    head[8:24, 16:64] = True
+    handle = np.zeros((80, 80), dtype=bool)
+    handle[24:72, 34:46] = True
+    object_mask = head | handle
+    object_mask_path = tmp_path / "object_mask.png"
+    save_mask(object_mask, object_mask_path)
+
+    parts, _, quality = SegmentationAgent(
+        image_path=image_path,
+        object_mask_path=object_mask_path,
+        object_bbox=mask_to_bbox(object_mask),
+        part_schema={
+            "object": "hammer",
+            "parts": [
+                {"name": "head", "text_prompts": ["hammer head"], "expected_materials": ["Metal"], "location": "top compact region", "shape_prior": "compact block", "visible": True},
+                {"name": "handle", "text_prompts": ["wooden handle"], "expected_materials": ["Wood"], "location": "long lower part", "shape_prior": "long thin bar", "visible": True},
+            ],
+        },
+        detector=None,
+        sam_tool=None,
+        vlm_client=NoVLMClient(),
+        output_dir=tmp_path / "scene",
+        candidates_dir=tmp_path / "scene" / "candidates",
+        coverage_threshold=0.90,
+        min_accept_score=0.35,
+        residual_policy="ignore",
+    ).run()
+
+    by_name = {p.name: p for p in parts}
+    assert quality["ok"]
+    assert mask_iou(read_mask(by_name["head"].mask_path), head) > 0.85
+    assert mask_iou(read_mask(by_name["handle"].mask_path), handle) > 0.85
+    assert by_name["handle"].bbox.y1 <= 26
 
 
 def test_weighted_median_and_aggregation():

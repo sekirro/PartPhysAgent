@@ -724,6 +724,8 @@ class SegmentationAgent:
         text = self._spec_text(spec)
         if is_collection_part(spec):
             return False
+        if any(key in text for key in ("handle", "grip", "long bar", "long thin", "stick", "shaft")):
+            return False
         return any(
             key in text
             for key in (

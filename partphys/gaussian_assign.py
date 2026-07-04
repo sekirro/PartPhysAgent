@@ -200,10 +200,19 @@ def _smooth_low_confidence_assignments(
     ids: np.ndarray,
     low_confidence: np.ndarray,
     high_confidence: np.ndarray,
+    exclude_source_part_ids: set[int] | None = None,
+    protected: np.ndarray | None = None,
     k: int = 12,
 ) -> tuple[np.ndarray, int]:
-    low_idx = np.where(low_confidence)[0]
-    high_idx = np.where(high_confidence & (ids >= 0))[0]
+    exclude_source_part_ids = exclude_source_part_ids or set()
+    source_ok = ids >= 0
+    if exclude_source_part_ids:
+        source_ok &= ~np.isin(ids, list(exclude_source_part_ids))
+    target_ok = np.asarray(low_confidence, dtype=bool).copy()
+    if protected is not None:
+        target_ok &= ~np.asarray(protected, dtype=bool)
+    low_idx = np.where(target_ok)[0]
+    high_idx = np.where(high_confidence & source_ok)[0]
     if len(low_idx) == 0 or len(high_idx) < max(3, k // 2):
         return ids, 0
     try:
@@ -237,6 +246,7 @@ def _knn_label_consistency_cleanup(
     positions: np.ndarray,
     ids: np.ndarray,
     residual_part_ids: set[int],
+    protected: np.ndarray | None = None,
     k: int = 16,
 ) -> tuple[np.ndarray, dict[str, int]]:
     assigned_idx = np.where(ids >= 0)[0]
@@ -257,6 +267,7 @@ def _knn_label_consistency_cleanup(
     new_ids = ids.copy()
     unknown_reassigned = 0
     island_reassigned = 0
+    protected = np.zeros(len(ids), dtype=bool) if protected is None else np.asarray(protected, dtype=bool)
 
     for row_pos, row in zip(assigned_idx, neighbor_ids):
         current = int(ids[row_pos])
@@ -278,6 +289,9 @@ def _knn_label_consistency_cleanup(
                 unknown_reassigned += 1
             continue
 
+        if protected[row_pos]:
+            continue
+
         own_count = int(np.sum(non_residual == current))
         own_frac = own_count / max(1, int(non_residual.size))
         if majority != current and own_frac <= 0.18 and majority_frac >= 0.68 and majority_count >= 7:
@@ -285,6 +299,53 @@ def _knn_label_consistency_cleanup(
             island_reassigned += 1
 
     return new_ids, {"unknown_reassigned": unknown_reassigned, "island_reassigned": island_reassigned}
+
+
+def _semantic_projection_rescue(
+    ids: np.ndarray,
+    scores: np.ndarray,
+    view_support: np.ndarray,
+    parts: list[dict[str, Any]],
+    residual_part_ids: set[int],
+    multi_view_available: bool,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    if scores.size == 0 or len(parts) == 0:
+        return ids, {"reassigned": 0, "per_part": {}}
+    new_ids = ids.copy()
+    support_threshold = 2 if multi_view_available else 1
+    min_target_count = max(64, int(round(0.003 * len(ids))))
+    per_part: dict[str, dict[str, int]] = {}
+    total_changed = 0
+    for part_idx, part in enumerate(parts):
+        pid = int(part["part_id"])
+        if pid in residual_part_ids:
+            continue
+        current_count = int((new_ids == pid).sum())
+        candidates = (scores[:, part_idx] > 0.0) & (view_support[:, part_idx] >= support_threshold)
+        candidate_count = int(candidates.sum())
+        if candidate_count == 0:
+            continue
+        target_count = min(candidate_count, min_target_count)
+        if current_count >= target_count:
+            continue
+        preferred = candidates & ((new_ids < 0) | np.isin(new_ids, list(residual_part_ids)))
+        preferred_idx = np.where(preferred)[0]
+        if preferred_idx.size == 0:
+            continue
+        needed = min(int(target_count - current_count), int(preferred_idx.size))
+        if needed <= 0:
+            continue
+        order = np.argsort(scores[preferred_idx, part_idx])[::-1]
+        chosen = preferred_idx[order[:needed]]
+        new_ids[chosen] = pid
+        total_changed += int(len(chosen))
+        per_part[str(pid)] = {
+            "before": current_count,
+            "after": int((new_ids == pid).sum()),
+            "candidate_count": candidate_count,
+            "reassigned": int(len(chosen)),
+        }
+    return new_ids, {"reassigned": total_changed, "per_part": per_part, "min_target_count": int(min_target_count)}
 
 
 def assign_by_projection(positions, part_masks, camera_meta_npz, image_size) -> dict[str, Any]:
@@ -364,6 +425,8 @@ def assign_by_projection(positions, part_masks, camera_meta_npz, image_size) -> 
         smoothed_count = 0
         knn_unknown_reassigned_count = 0
         knn_island_reassigned_count = 0
+        semantic_protected_count = 0
+        semantic_rescue_stats: dict[str, Any] = {"reassigned": 0, "per_part": {}}
         mean_view_support = 0.0
         margin_stats = {"mean": 0.0, "p10": 0.0}
         if used_labels:
@@ -393,11 +456,32 @@ def assign_by_projection(positions, part_masks, camera_meta_npz, image_size) -> 
             low_confidence_count = int(low_confidence.sum())
             for part_idx, part in enumerate(parts):
                 ids[assigned_mask & (best == part_idx)] = int(part["part_id"])
+            best_part_ids = np.asarray([int(parts[int(idx)]["part_id"]) for idx in best], dtype=np.int32)
+            semantic_protected = assigned_mask & ~np.isin(best_part_ids, list(residual_part_ids)) & (
+                (best_support >= (2 if multi_view_available else 1))
+                | (margin_ratio >= 0.35)
+            )
+            semantic_protected_count = int(semantic_protected.sum())
             if low_confidence_count:
-                ids, smoothed_count = _smooth_low_confidence_assignments(positions, ids, low_confidence, high_confidence)
-            ids, knn_stats = _knn_label_consistency_cleanup(positions, ids, residual_part_ids)
+                ids, smoothed_count = _smooth_low_confidence_assignments(
+                    positions,
+                    ids,
+                    low_confidence,
+                    high_confidence,
+                    exclude_source_part_ids=residual_part_ids,
+                    protected=semantic_protected,
+                )
+            ids, knn_stats = _knn_label_consistency_cleanup(positions, ids, residual_part_ids, protected=semantic_protected)
             knn_unknown_reassigned_count = int(knn_stats.get("unknown_reassigned", 0))
             knn_island_reassigned_count = int(knn_stats.get("island_reassigned", 0))
+            ids, semantic_rescue_stats = _semantic_projection_rescue(
+                ids,
+                scores,
+                view_support,
+                parts,
+                residual_part_ids,
+                multi_view_available,
+            )
         else:
             warnings.append("No readable projection masks for any camera view.")
         assigned = ids >= 0
@@ -425,6 +509,8 @@ def assign_by_projection(positions, part_masks, camera_meta_npz, image_size) -> 
             "smoothed_count": int(smoothed_count),
             "knn_unknown_reassigned_count": knn_unknown_reassigned_count,
             "knn_island_reassigned_count": knn_island_reassigned_count,
+            "semantic_protected_count": semantic_protected_count,
+            "semantic_rescue": semantic_rescue_stats,
         }
     except Exception as exc:
         return {"gaussian_part_ids": ids, "assigned_ratio": 0.0, "per_part_counts": {}, "warnings": [f"Projection assignment failed: {exc}"]}

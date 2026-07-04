@@ -431,6 +431,39 @@ def _clean_color_mask(mask: np.ndarray, min_area: int) -> np.ndarray:
     return np.logical_or.reduce(comps).astype(bool)
 
 
+def _select_color_component_for_spec(mask: np.ndarray, spec: PartSpec, object_mask: np.ndarray, min_area: int) -> np.ndarray:
+    comps = connected_components_from_mask(mask, min_area)
+    if not comps:
+        return np.zeros_like(mask, dtype=bool)
+    if is_collection_part(spec) or is_main_like_part(spec):
+        return np.logical_or.reduce(comps).astype(bool)
+
+    text = part_text(spec)
+    obj_bbox = mask_to_bbox(object_mask)
+    obj_w = max(1, obj_bbox.width or object_mask.shape[1])
+    obj_h = max(1, obj_bbox.height or object_mask.shape[0])
+    scored = []
+    for comp in comps:
+        bbox = mask_to_bbox(comp)
+        area = max(1, mask_area(comp))
+        cy = ((bbox.y1 + bbox.y2) * 0.5 - obj_bbox.y1) / obj_h
+        aspect = bbox.width / max(1, bbox.height)
+        score = float(area)
+        if any(k in text for k in ("top", "upper", "head", "compact", "block", "frosting", "icing", "cream")):
+            score *= 1.0 + max(0.0, 1.0 - cy)
+        if any(k in text for k in ("bottom", "lower", "handle", "grip", "plate", "dish", "stand", "tray")):
+            score *= 1.0 + max(0.0, cy)
+        if any(k in text for k in ("handle", "grip", "long", "thin", "bar", "stick")):
+            score *= 1.0 + min(1.0, bbox.height / obj_h)
+            if aspect < 0.65:
+                score *= 1.25
+        if any(k in text for k in ("head", "compact", "block")):
+            score *= 1.0 + min(1.0, bbox.width / obj_w)
+        scored.append((score, area, comp))
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return scored[0][2].astype(bool)
+
+
 def _color_prior_masks(image, object_mask: np.ndarray, specs: list[PartSpec], min_area: int) -> list[tuple[PartSpec, np.ndarray, dict[str, Any]]]:
     arr = np.asarray(image.convert("RGB")).astype(np.float32)
     r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
@@ -438,22 +471,31 @@ def _color_prior_masks(image, object_mask: np.ndarray, specs: list[PartSpec], mi
     minc = np.minimum.reduce([r, g, b])
     sat = maxc - minc
     h, _ = object_mask.shape
-    yy = np.arange(h, dtype=np.float32)[:, None] / max(1, h - 1)
+    obj_bbox = mask_to_bbox(object_mask)
+    obj_y1 = float(obj_bbox.y1)
+    obj_h = float(max(1, obj_bbox.height or h))
+    yy = (np.arange(h, dtype=np.float32)[:, None] - obj_y1) / obj_h
     out: list[tuple[PartSpec, np.ndarray, dict[str, Any]]] = []
     for spec in specs:
         text = part_text(spec)
-        color_text = " ".join([spec.name, *list(spec.text_prompts or [])]).lower()
+        color_text = " ".join([spec.name, *list(spec.text_prompts or []), *list(spec.expected_materials or [])]).lower()
         pos = np.ones_like(object_mask, dtype=bool)
         if any(k in color_text for k in ("strawber", "berr", "topping")):
             pos &= yy < 0.50
         elif any(k in text for k in ("top", "upper", "frosting", "icing", "cream")):
             pos &= yy < 0.66
-        if any(k in text for k in ("bottom", "lower", "plate", "dish", "stand", "tray")):
+        if any(k in text for k in ("handle", "grip", "long lower", "long thin")):
+            pos &= yy > 0.18
+        elif any(k in text for k in ("bottom", "lower", "plate", "dish", "stand", "tray")):
             pos &= yy > 0.50
         if any(k in text for k in ("middle", "cylinder", "base", "body", "cake layer")) and not any(k in text for k in ("plate", "dish", "stand")):
             pos &= (yy > 0.34) & (yy < 0.84)
 
         masks: list[tuple[str, np.ndarray]] = []
+        if any(k in color_text for k in ("metal", "steel", "iron", "silver", "gray", "grey")):
+            masks.append(("metal_gray", (maxc > 45) & (maxc < 230) & (sat < 80) & (minc > maxc * 0.52)))
+        if any(k in color_text for k in ("wood", "wooden", "brown")):
+            masks.append(("wood_brown", (r > 45) & (g > 25) & (r > b * 1.20) & (g > b * 1.05) & (r >= g * 0.85) & (sat > 18)))
         if any(k in color_text for k in ("red", "strawber", "berr")):
             masks.append(("red", (r > 120) & (r > g * 1.12) & (r > b * 1.12) & (sat > 28)))
         if any(k in color_text for k in ("white", "cream", "frosting", "icing", "ceramic", "plate", "dish")):
@@ -465,10 +507,14 @@ def _color_prior_masks(image, object_mask: np.ndarray, specs: list[PartSpec], mi
             mask = _clean_color_mask(mask, min_area)
             if mask.sum() < min_area:
                 continue
-            if is_collection_part(spec):
-                comps = connected_components_from_mask(mask, min_area)
-                if comps:
-                    mask = np.logical_or.reduce(comps).astype(bool)
+            mask = _select_color_component_for_spec(mask, spec, object_mask, min_area)
+            if mask.sum() < min_area:
+                continue
+            area_ratio = float(mask.sum() / max(1, mask_area(object_mask)))
+            if not is_main_like_part(spec) and area_ratio > 0.85:
+                continue
+            if color_name == "metal_gray" and any(k in text for k in ("head", "compact", "block")) and area_ratio > 0.62:
+                continue
             out.append((spec, mask, {"color_prior": color_name, "source": "color_prior"}))
     return out
 
